@@ -2,39 +2,85 @@
 #include <iostream>
 #include <csignal>
 
-bool keepRunning = true;
-void signalHandler(int s) { keepRunning = false; }
+bool running = true;
+
+void signalHandler(int signum) {
+    std::cout << "\n[INFO] Interrupt signal (" << signum << ") received. Stopping..." << std::endl;
+    running = false;
+}
 
 int main() {
     signal(SIGINT, signalHandler);
 
-    // 1. Capture Raw Frames via V4L2
-    cv::VideoCapture cap(0, cv::CAP_V4L2);
-    if (!cap.isOpened()) return -1;
+    // ==================================================================================
+    // PIPELINE 1: CAPTURE (Fixed)
+    // ==================================================================================
+    // Added 'queue' to decouple camera thread from app thread.
+    // Added 'sync=false' to appsink to prevent clock drift issues.
+    std::string capture_pipeline = 
+        "libcamerasrc ! video/x-raw, width=1920, height=1080, framerate=30/1 ! "
+        "queue max-size-buffers=1 ! "
+        "videoconvert ! video/x-raw, format=BGR ! "
+        "appsink drop=true sync=false";
 
-    // Set format to YUYV (Raw) to ensure no hardware H264 decoding is happening
-    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('Y', 'U', 'Y', 'V'));
-    cap.set(cv::CAP_PROP_FRAME_WIDTH, 640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+    std::cout << "[INFO] Opening Capture Pipeline..." << std::endl;
+    // We use CAP_GSTREAMER explicitly to avoid ambiguity
+    cv::VideoCapture cap(capture_pipeline, cv::CAP_GSTREAMER);
 
-    // 2. Prepare Software Encoder
-    // 'X264' is a software-based H.264 implementation
-    int codec = cv::VideoWriter::fourcc('X', '2', '6', '4');
-    cv::VideoWriter writer("output.mp4", codec, 30, cv::Size(640, 480));
-
-    cv::Mat frame;
-    while (keepRunning) {
-        if (!cap.read(frame)) break;
-
-        // Draw a rectangle (The processing step)
-        cv::rectangle(frame, cv::Point(150, 150), cv::Point(450, 350), cv::Scalar(0, 255, 0), 2);
-
-        // Save frame using CPU-based encoding
-        writer.write(frame);
+    if (!cap.isOpened()) {
+        std::cerr << "[ERROR] Failed to open camera pipeline." << std::endl;
+        std::cerr << "[TIP] Try running: GST_DEBUG=3 ./cam_record to see internal errors." << std::endl;
+        return -1;
     }
 
-    std::cout << "Releasing resources and saving file..." << std::endl;
+    // ==================================================================================
+    // PIPELINE 2: HARDWARE ENCODING (Fixed)
+    // ==================================================================================
+    // Added 'video/x-h264,profile=high' to ensure compatibility
+    std::string output_pipeline = 
+        "appsrc ! videoconvert ! video/x-raw, format=I420 ! "
+        "v4l2h264enc ! video/x-h264, level=(string)4 ! "
+        "h264parse ! mp4mux ! "
+        "filesink location=output.mp4";
+
+    std::cout << "[INFO] Opening Writer Pipeline..." << std::endl;
+    cv::VideoWriter writer(output_pipeline, cv::CAP_GSTREAMER, 0, 30, cv::Size(1920, 1080), true);
+
+    if (!writer.isOpened()) {
+        std::cerr << "[ERROR] Failed to open output pipeline." << std::endl;
+        return -1;
+    }
+
+    cv::Mat frame;
+    int frame_count = 0;
+
+    std::cout << "[INFO] Recording... Press Ctrl+C to stop." << std::endl;
+
+    while (running) {
+        if (!cap.read(frame)) {
+            // If the pipeline breaks, we exit immediately
+            std::cout << "[WARN] Frame capture failed." << std::endl;
+            break;
+        }
+
+        // Draw the green square
+        int cx = frame.cols / 2;
+        int cy = frame.rows / 2;
+        cv::rectangle(frame, cv::Point(cx - 50, cy - 50), cv::Point(cx + 50, cy + 50), cv::Scalar(0, 255, 0), 2);
+
+        writer.write(frame);
+
+        frame_count++;
+        if (frame_count % 30 == 0) {
+            std::cout << "Encoded " << frame_count << " frames..." << "\r" << std::flush;
+        }
+    }
+
+    std::cout << "\n[INFO] Releasing resources..." << std::endl;
     cap.release();
     writer.release();
+    cv::destroyAllWindows();
+    std::cout << "[INFO] Done. Video saved to output.mp4" << std::endl;
+
     return 0;
 }

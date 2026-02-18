@@ -62,3 +62,37 @@ These operations can be pretty expensive, we will test to see how long they take
 Additionally, [Gstreamer](https://gemini.google.com/share/61ab6a969a65) can be used to perform some of these operations and is supposed to leverage the GPU. Yet to be determined is the cost of using the operations when it comes to memory handoff between the CPU and gpu (especially if memory has to be flushed from cache.)
 
 It may be possible to use Gstreamer for everything from capture to encode.
+
+# Gstreamer
+
+Current best working command:
+`gst-launch-1.0 -e libcamerasrc ! capsfilter caps=video/x-raw,width=1920,height=1080,format=NV12,interlace-mode=progressive ! v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! 'video/x-h264,level=(string)4' ! h264parse ! mp4mux ! filesink location = Downloads/test.mp4`
+
+Working pipeline for gl transformation
+`gst-launch-1.0 libcamerasrc ! video/x-raw,width=1280,height=720,format=NV12 ! \
+glupload ! glcolorconvert ! gltransformation rotation-z=180 ! \
+glimagesink`
+
+Turns out that chat says you cannot use the h264 encoder for anything that is not in the ISP memory space. Not sure if true, but was way to hard to get working.
+
+## Software Encoding option
+
+RPI (Supposed to be minimal CPU load, still at 50%):
+`gst-launch-1.0   libcamerasrc   ! video/x-raw,width=1920,height=1080,framerate=30/1,format=I420   ! queue max-size-buffers=4 leaky=downstream   ! x264enc       tune=zerolatency       speed-preset=ultrafast       bitrate=6000       key-int-max=30       bframes=0       cabac=false       ref=1       sliced-threads=true       threads=4   ! video/x-h264,profile=baseline   ! rtph264pay pt=96 config-interval=1   ! udpsink host=192.168.1.9 port=5000 sync=false`
+
+PC (With stats overlay):
+`gst-launch-1.0 \
+  udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
+  ! rtpjitterbuffer latency=0 \
+  ! rtph264depay \
+  ! h264parse \
+  ! avdec_h264 \
+  ! videoconvert \
+  ! fpsdisplaysink video-sink=autovideosink text-overlay=true sync=false`
+
+RPi (with GL pipeline and simple transform):
+``
+Only Ran at 10fps. Next steps:
+- test transform on laptop after decode
+- were raw images running faster? I think those had gl transform
+- Package IMU data in mp4 container?
