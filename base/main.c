@@ -2,6 +2,14 @@
 #include <math.h>
 #include <stdio.h>
 
+#include <gst/video/video.h>
+#include <gst/gl/gl.h> // <--- Add this for GstGLShader and uniform functions
+#include <math.h>
+#include <stdio.h>
+
+float live_k1 = 0.3f;
+float live_zoom = 1.1f;
+
 const gchar *distort_shader = 
     "#version 100\n"
     "#ifdef GL_ES\n"
@@ -9,14 +17,12 @@ const gchar *distort_shader =
     "#endif\n"
     "varying vec2 v_texcoord;\n"
     "uniform sampler2D tex;\n"
-    "uniform float time;\n"
-    "uniform float width;\n"
-    "uniform float height;\n"
+    "uniform float k1;\n" // Custom uniform for distortion
+    "uniform float zoom;\n" // Custom uniform for zoom
     "void main () {\n"
-    "  float zoom = 1.1;\n"
-    "  vec2 uv = (v_texcoord - 0.5) * zoom;\n"
+    "  vec2 uv = (v_texcoord - 0.5) * 1.1;\n"
     "  float r2 = dot(uv, uv);\n"
-    "  vec2 distorted_uv = uv * (1.0 + 0.3 * r2 + 0.1 * r2 * r2);\n"
+    "  vec2 distorted_uv = uv * (1.0 + k1 * r2);\n"
     "  gl_FragColor = texture2D(tex, distorted_uv + 0.5);\n"
     "}\n";
 
@@ -25,6 +31,25 @@ typedef struct _CustomData {
     GstElement *pipeline;
     GstElement *stab[4];
 } CustomData;
+
+// The signal signature for "update-shader"
+static void on_update_shader(GstElement *glshader, GstGLShader *shader, gpointer user_data) {
+    // These functions push your C variables to the GPU uniforms
+    gst_gl_shader_set_uniform_1f(shader, "k1", live_k1);
+    gst_gl_shader_set_uniform_1f(shader, "zoom", live_zoom);
+}
+
+static gboolean on_draw_signal(GstElement *glfilter, GstGLShader *shader, 
+                               guint texture, guint width, guint height, 
+                               gpointer user_data) {
+    // Set the uniforms on the shader object provided by the signal
+    gst_gl_shader_set_uniform_1f(shader, "k1", live_k1);
+    gst_gl_shader_set_uniform_1f(shader, "zoom", live_zoom);
+    
+    // Return FALSE to let GStreamer proceed with the default draw
+    return FALSE; 
+}
+
 
 // This function acts as our "Fake IMU" data feed
 static gboolean update_fake_imu_cb(gpointer user_data) {
@@ -37,6 +62,28 @@ static gboolean update_fake_imu_cb(gpointer user_data) {
     gfloat sway_x = sin(time_t) * 0.1f; 
     gfloat sway_y = cos(time_t * 0.5f) * 0.05f; 
     gfloat rotation = sin(time_t * 0.8f) * 5.0f; 
+
+    float k1 = 0.3 + (sin(time_t) * 1.0);
+    float zoom = 1.1;
+
+    GstStructure *vars = gst_structure_new("uniforms",
+        "k1", G_TYPE_FLOAT, k1,
+        "zoom", G_TYPE_FLOAT, zoom,
+        NULL);
+
+    // 3. Push the structure to all 4 shader elements
+    for (int i = 0; i < 4; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "lens%d", i);
+        GstElement *shader = gst_bin_get_by_name(GST_BIN(data->pipeline), name);
+        if (shader) {
+            // The "vars" property is the magic bridge to the uniforms
+            g_object_set(shader, "uniforms", vars, NULL);
+            gst_object_unref(shader);
+        }
+    }
+
+    gst_structure_free(vars);
 
     // Apply the correction to all 4 video streams
     for (int i = 0; i < 4; i++) {
@@ -70,11 +117,11 @@ static void * run_pipeline(gpointer user_data) {
         "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=true "
         
         // Stream 0
-        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
         "glshader name=lens0 ! gltransformation name=stab0 ! mix.sink_0 "
         
         // Stream 1
-        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
         "glshader name=lens1 ! gltransformation name=stab1 ! mix.sink_1 "
         
         // Stream 2
@@ -100,6 +147,7 @@ static void * run_pipeline(gpointer user_data) {
         GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(data.pipeline), name);
         if (shader_elem) {
             g_object_set(shader_elem, "fragment", distort_shader, NULL);
+            g_signal_connect(shader_elem, "update-shader", G_CALLBACK(on_draw_signal), NULL);
             gst_object_unref(shader_elem);
             g_print("Injected shader into %s\n", name);
         }
@@ -112,7 +160,7 @@ static void * run_pipeline(gpointer user_data) {
     data.stab[3] = gst_bin_get_by_name(GST_BIN(data.pipeline), "stab3");
 
     // Set up a GLib timer to fire every 33ms (~30fps)
-    g_timeout_add(10, update_fake_imu_cb, &data);
+    g_timeout_add(16, update_fake_imu_cb, &data);
 
     // Start playing
     gst_element_set_state(data.pipeline, GST_STATE_PLAYING);
