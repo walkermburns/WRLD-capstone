@@ -2,6 +2,24 @@
 #include <math.h>
 #include <stdio.h>
 
+const gchar *distort_shader = 
+    "#version 100\n"
+    "#ifdef GL_ES\n"
+    "precision mediump float;\n"
+    "#endif\n"
+    "varying vec2 v_texcoord;\n"
+    "uniform sampler2D tex;\n"
+    "uniform float time;\n"
+    "uniform float width;\n"
+    "uniform float height;\n"
+    "void main () {\n"
+    "  float zoom = 1.1;\n"
+    "  vec2 uv = (v_texcoord - 0.5) * zoom;\n"
+    "  float r2 = dot(uv, uv);\n"
+    "  vec2 distorted_uv = uv * (1.0 + 0.3 * r2 + 0.1 * r2 * r2);\n"
+    "  gl_FragColor = texture2D(tex, distorted_uv + 0.5);\n"
+    "}\n";
+
 // Structure to hold our elements so the timer callback can access them
 typedef struct _CustomData {
     GstElement *pipeline;
@@ -52,7 +70,7 @@ static void * run_pipeline(gpointer user_data) {
         "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=true "
         
         // Stream 0
-        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
         "glshader name=lens0 ! gltransformation name=stab0 ! mix.sink_0 "
         
         // Stream 1
@@ -60,11 +78,11 @@ static void * run_pipeline(gpointer user_data) {
         "glshader name=lens1 ! gltransformation name=stab1 ! mix.sink_1 "
         
         // Stream 2
-        "videotestsrc pattern=2 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
         "glshader name=lens2 ! gltransformation name=stab2 ! mix.sink_2 "
         
         // Stream 3
-        "videotestsrc pattern=3 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
         "glshader name=lens3 ! gltransformation name=stab3 ! mix.sink_3";
 
     // Launch the pipeline
@@ -73,6 +91,18 @@ static void * run_pipeline(gpointer user_data) {
         g_printerr("Could not build pipeline: %s\n", error->message);
         g_clear_error(&error);
         return NULL;
+    }
+
+    // 3. Manually inject the shader string into the 4 lens elements
+    for (int i = 0; i < 4; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "lens%d", i);
+        GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(data.pipeline), name);
+        if (shader_elem) {
+            g_object_set(shader_elem, "fragment", distort_shader, NULL);
+            gst_object_unref(shader_elem);
+            g_print("Injected shader into %s\n", name);
+        }
     }
 
     // Get the stabilization elements from the pipeline so we can control them
