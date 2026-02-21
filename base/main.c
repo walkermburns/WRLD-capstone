@@ -66,6 +66,7 @@ static gboolean update_fake_imu_cb(gpointer user_data) {
     float k1 = 0.3 + (sin(time_t) * 1.0);
     float zoom = 1.1;
 
+    // Create structure elsewhere and use gst_structure_set to prevent memory allocs
     GstStructure *vars = gst_structure_new("uniforms",
         "k1", G_TYPE_FLOAT, k1,
         "zoom", G_TYPE_FLOAT, zoom,
