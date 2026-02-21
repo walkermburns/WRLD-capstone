@@ -1,0 +1,8 @@
+targets:
+  - name: pi1
+    host: walker@raspberrypi
+    path: "~/buoy/src"
+
+  # - name: pi2
+  #   host: pi@192.168.1.102
+  #   path: /home/pi/buoy_app
