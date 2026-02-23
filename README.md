@@ -1,6 +1,53 @@
 # WRLD-capstone
 Team WRLD's interdisciplinary capstone design project
 
+# Overall Software Details
+
+The Mora system is split into two parts: a **buoy** and a **base station**. Buoys are the modular part of the system. Theoretically, as long as bandwith allows, and software scales, there can be infinite buoys. The hardware will have a camera and an IMU and will transmit this data through a daisy-chained network using bridged network interfaces.
+The base station will receive all of the data from the buoys and will stitch together the video feeds to give the final image as well as record the data.
+
+## Buoy Software
+The buoy software is simple to reduce load on the limited hardware of the Raspberry Pi and to reduce the software complexity of each node.
+
+Buoy Functions:
+- Send low latency UDP video stream (timestamped)
+- Send IMU data over UDP using protobuf
+- Indicate status with LEDs?
+- Detect leaks?
+
+## Base Station Software
+The base station software will be much more complex. At the cost of reducing software complexity on each of the buoys (in the interest of reducing distributed development headaches and not dealing with the limited compute) The base station must pick up a lot of the slack.
+
+Base station functions:
+- Time Sync Server (NTP or PTP)
+- Recieve and synchronize IMU data with recieved video frames
+- Perform lens distortion correction
+- Perform video stabilization from IMU data
+- Stitch together video feeds
+- Record stitched feed
+- Detect swimmer using OpenCV
+- Zoom into stitched feed to highlight swimmer
+- Overlay pose estimation data and other statistics. (stretch)
+- Display augmented video on pool deck
+- Record augmented video
+
+Most of the heavy lifting of the base station software will be handled by GStreamer, an open platform that can handle the transmission of network video and live video compositing tasks using openGL plugins.
+
+## Scripts
+Scripts will make or break the usability of Mora. In both development and deplyment, having to individually manage many devices is going to be a pain. We must be able to use scripts to deploy images to the Pis for development as well as to startup the system.
+
+## Software notes
+
+### Configs
+Config files will alow for easy changing of variables (maybe even without rebuilding).
+
+Mora.proto contains the protobuf message definitions for the system. This will mostly be used for IMU data as well as some other misc. statistics (hardware usage, leak detection, LED commands)
+
+targets.yaml describes each of the buoys with fields such as names, IPs, and whether the network is a bridged node. In this way, it will be used as a sort of network map to describe how each of the devices will connect to each other. Both the buoy scripts and the base station software will need to read from this yaml to determine how many nodes are active, what their IPs and ports will be, and any other hardware specifics.
+
+### GStreamer
+Gstreamer 
+
 # Raspberry Pi Setup
 
 ## Network Manager
