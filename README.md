@@ -46,7 +46,21 @@ Mora.proto contains the protobuf message definitions for the system. This will m
 targets.yaml describes each of the buoys with fields such as names, IPs, and whether the network is a bridged node. In this way, it will be used as a sort of network map to describe how each of the devices will connect to each other. Both the buoy scripts and the base station software will need to read from this yaml to determine how many nodes are active, what their IPs and ports will be, and any other hardware specifics.
 
 ### GStreamer
-Gstreamer 
+Gstreamer is a tool for creating video pipelines, pipelines are described by a !-separated list of descriptions for each of the pipeline stages, whether that be a source (video file or network stream), sink (destination - video player or recording), converters (that convert pixel formats RGB, YUV for different pipeline elements), or pads that allow input or output access on a pipeline. Documentation is available [here](https://gstreamer.freedesktop.org/documentation/tutorials/index.html?gi-language=c).
+
+Some notes on the software that we have defined so far:
+
+Afaik in gstreamer variables must be defined before they are used in pipelines, same as in code. This is why we define our video mixer and all of the sinks first, then the sources are sent to each of the sinks. In a traditional linear pipeline, there are not "variable" definitions, so the sink (such as filesink or appsink) can be defined at the end. When using named sinks or variables, these probably need to be first.
+
+Chat is taking a shortcut by using the text definition of the pipeline, gstreamer pipelines can be written and created in full c, but the way we have it written right now is that the pipeline is written in the !-separated format then parsed usign `gst_parse_launch`
+
+Because of this, there is a lot of extra code that is required to parse elements or handles from the string defintion since they have not been defined before in variables. `gst_bin_get_by_name(GST_BIN(data.pipeline)`
+
+The properties of elements/plugins are defined in the documentation. This is an example for [glshader](https://gstreamer.freedesktop.org/documentation/opengl/glshader.html?gi-language=c). This element has pads for input and output (sink and source), signals that can be connected directly to c variables using `g_signal_connect()`, and properties that can be read from or written to using `g_object_set()`.
+
+As there is no signal for updating the internal shader variables, we use uniform variables that can be updated externally by setting the 'uniforms' property between each frame. Currently we are creating the structure with this data, sending to the shader, then deleting or unreferencing the shader. This is all done in the imu update function.
+
+The image warping is performed by an openGL shader. the shader reads in a string or a .frag file that uses the openGL language to define the vector and matrix operations that will be performed on the image. idk anything about shaders yet lol
 
 # Raspberry Pi Setup
 
