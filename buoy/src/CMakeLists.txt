@@ -3,7 +3,7 @@ project(buoy_app)
 
 find_package(Protobuf REQUIRED)
 
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS buoy.proto)
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS configs/buoy.proto)
 
 add_library(proto_lib STATIC ${PROTO_SRCS} ${PROTO_HDRS})
 target_compile_features(proto_lib PUBLIC cxx_std_17)

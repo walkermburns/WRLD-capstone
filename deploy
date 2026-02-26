@@ -6,8 +6,12 @@ import threading
 import yaml
 import sys
 from pathlib import Path
+import os
+import shutil
 
-SRC_DIR = Path("src").resolve()
+CWD = Path.cwd() # Current Working Directory
+BUOY_DIR = CWD / "buoy"
+SRC_DIR = BUOY_DIR / "src"
 
 
 def run_cmd(cmd):
@@ -123,6 +127,15 @@ def main():
 
     with open("targets.yaml") as f:
         targets = yaml.safe_load(f)["targets"]
+
+    # Setup dirs before copy
+    # Copy config and proto
+    destination_dir = SRC_DIR / "configs/"
+    if destination_dir and not os.path.exists(destination_dir):
+        os.mkdir(destination_dir)
+        print(f"Created: {destination_dir}")
+    print(CWD)
+    shutil.copy2((CWD / "buoy.proto"), (SRC_DIR / "configs/buoy.proto") )
 
     threads = []
     results = []
