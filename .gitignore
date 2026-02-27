@@ -1,3 +1,4 @@
 .vscode
 ./build/
 buoy/src/configs
+/build
