@@ -1,27 +1,4 @@
 
-// #include <iostream>
-// #include <string>
-// #include <random>
-// #include <chrono>
-// #include <sys/socket.h>
-// #include <netinet/in.h>
-// #include <arpa/inet.h>
-// #include <unistd.h>
-
-// int main() {
-    
-//     IMU imu;
-    
-//     try {
-//         while (true) {
-//             imu.read_sensor();
-//             usleep(200000);
-//         }
-//     } catch (const std::exception& e) {
-//         std::cerr << "Error: " << e.what() << std::endl;
-//     }
-// }
-
 #include "BNO055.h"
 #include <thread>
 #include <atomic>
@@ -40,11 +17,11 @@ static std::mutex queueMutex;
 // =============================
 // Sensor Thread (100 Hz)
 // =============================
-void sensorLoop(IMU imu)
+void sensorLoop(IMUInterface &imu)
 {
     while (running)
     {
-        IMUData_t data = imu.read_sensor();
+        IMUData_t data = imu.readSensor();
 
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -119,13 +96,15 @@ int main()
 {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-    IMU imu;
+    // create concrete sensor implementation; defaults match original
+    BNO055Driver imu;
 
     if (!imu.init()) {
         return -1;
     }
 
-    std::thread sensorThread(sensorLoop, imu);
+    // pass by reference to avoid slicing
+    std::thread sensorThread(sensorLoop, std::ref(imu));
     std::thread networkThread(senderLoop, "192.168.1.9", 5000);
 
     std::this_thread::sleep_for(std::chrono::seconds(60));

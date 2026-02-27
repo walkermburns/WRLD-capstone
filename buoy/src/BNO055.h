@@ -1,28 +1,24 @@
-#include "IMU.h" // class template for IMUs that BNO055 will override
+#pragma once
 
-constexpr uint8_t REG_CHIP_ID  = 0x00;
-constexpr uint8_t REG_PAGE_ID  = 0x07;
-constexpr uint8_t REG_OPR_MODE = 0x3D;
-constexpr uint8_t REG_PWR_MODE = 0x3E;
-constexpr uint8_t REG_SYS_TRIGGER = 0x3F;
+#include "IMU.h"
+#include "I2CTransport.h"
+#include "BNO055_registers.h"
 
-constexpr uint8_t MODE_CONFIG  = 0x00;
-constexpr uint8_t MODE_NDOF    = 0x0C;
-constexpr uint8_t POWER_NORMAL = 0x00;
+#include <string>
 
-class IMU {
-    public:
+// Driver for the Bosch BNO055 IMU.  The implementation hides all of the
+// chip‑specific register magic and talks to the sensor over an
+// I2CTransport instance.  The public API is defined by IMUInterface so
+// that calling code can remain sensor‑agnostic.
 
-        IMU();
+class BNO055Driver : public IMUInterface {
+public:
+    BNO055Driver(const std::string &i2cDevice = "/dev/i2c-1", uint8_t address = 0x28);
 
-        bool init();
-        const IMUData_t& read_sensor();
+    bool init() override;
+    const IMUData_t &readSensor() override;
 
-        // const IMUdata_t& get_IMU_data() { return data; };
-
-    private:
-        char *i2cDevice = nullptr;
-        uint8_t i2cAddr = 0x0;
-        int g_fd = -1;
-        IMUData_t data;
+private:
+    I2CTransport transport;
+    IMUData_t data;
 };
