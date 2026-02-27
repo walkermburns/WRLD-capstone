@@ -1,7 +1,16 @@
 syntax = "proto3";
 package buoy_proto;
 
-message IMU {
-  uint32 data = 1;
-  uint64 timestamp = 2;
+message IMU_proto {
+  float acc_x = 1;
+  float acc_y = 2;
+  float acc_z = 3;
+  float gyr_x = 4;
+  float gyr_y = 5;
+  float gyr_z = 6;
+  float quat_w = 7;
+  float quat_x = 8;
+  float quat_y = 9;
+  float quat_z = 10;
+  uint64 timestamp = 11;
 }
