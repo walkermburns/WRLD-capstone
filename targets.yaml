@@ -3,6 +3,7 @@ targets:
     host: walker@raspberrypi
     LAN_IP: 192.168.1.10
     path: "~/buoy/"
+    video_port: 5001
 
   # - name: pi2
   #   host: pi@192.168.1.102

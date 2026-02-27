@@ -136,6 +136,13 @@ glimagesink`
 
 Turns out that chat says you cannot use the h264 encoder for anything that is not in the ISP memory space. Not sure if true, but was way to hard to get working.
 
+hardware encode command without any GL
+`gst-launch-1.0 -e libcamerasrc ! "video/x-raw,width=1920,height=1080,framerate=30/1" ! queue max-size-buffers=2 leaky=downstream ! v4l2h264enc extra-controls="controls,video_bitrate=5000000,repeat_sequence_header=1" ! "video/x-h264,level=(string)4" ! rtph264pay config-interval=1 pt=96 ! udpsink host=192.168.1.9 port=5000 sync=false`
+
+Was able to get up to 20Mbit
+`walker@raspberrypi:~/buoy/build $ gst-launch-1.0 -e libcamerasrc ! "video/x-raw,width=1920,height=1080,framerate=30/1" ! queue max-size-buffers=1 leaky=downstream ! v4l2h264enc extra-controls="controls,video_bitrate=20000000,repeat_sequence_header=1,iframe-period=30" ! "video/x-h264,level=(string)4" ! rtph2
+64pay config-interval=1 pt=96 ! udpsink host=192.168.1.9 port=5000 sync=false`
+
 ## Software Encoding option
 
 RPI (Supposed to be minimal CPU load, still at 50%):
