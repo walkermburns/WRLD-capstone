@@ -136,6 +136,8 @@ def main():
         print(f"Created: {destination_dir}")
     print(CWD)
     shutil.copy2((CWD / "buoy.proto"), (SRC_DIR / "configs/buoy.proto") )
+    # TODO: This will need to be customized for each target, removing the other targets.
+    shutil.copy2((CWD / "targets.yaml"), (SRC_DIR / "configs/targets.yaml") )
 
     threads = []
     results = []

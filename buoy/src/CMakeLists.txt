@@ -17,9 +17,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(buoy_app main.cpp BNO055.cpp I2CTransport.cpp IMUProtoSender.cpp VideoStreamer.cpp)
+add_executable(buoy_app main.cpp BNO055.cpp I2CTransport.cpp IMUProtoSender.cpp VideoStreamer.cpp Config.cpp)
 
 target_link_libraries(buoy_app PRIVATE proto_lib)
 
 target_include_directories(buoy_app PRIVATE ${GST_INCLUDE_DIRS})
-target_link_libraries(buoy_app PRIVATE ${GST_LIBRARIES})
+target_link_libraries(buoy_app PRIVATE ${GST_LIBRARIES} yaml-cpp)

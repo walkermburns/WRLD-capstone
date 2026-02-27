@@ -12,6 +12,7 @@
 #include "buoy.pb.h"
 #include "IMUProtoSender.h"
 #include "VideoStreamer.h"
+#include "Config.h"
 
 static std::atomic<bool> running{true};
 static std::queue<IMUData> imuQueue;
@@ -69,6 +70,18 @@ int main()
 {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
 
+    // read configuration describing this target
+    TargetConfig cfg;
+    if (!loadTargetConfig("../src/configs/targets.yaml", cfg)) {
+        std::cerr << "Failed to load target configuration\n";
+        return -1;
+    }
+
+    std::cout << "[main] loaded config: baseIp=" << cfg.baseIp
+              << " buoyIp=" << cfg.buoyIp
+              << " imuPort=" << cfg.imuPort
+              << " videoPort=" << cfg.videoPort << "\n";
+
     // create concrete sensor implementation; defaults match original
     BNO055Driver imu;
 
@@ -80,13 +93,14 @@ int main()
     std::cout << "[main] starting sensor thread\n";
     std::thread sensorThread(sensorLoop, std::ref(imu));
 
-    // create sender instance and give it to the thread
-    IMUProtoSender sender("192.168.1.9", 5000);
+    // create sender instance based on config and give it to the thread
+    // send IMU/video to base station
+    IMUProtoSender sender(cfg.baseIp.c_str(), cfg.imuPort);
     std::cout << "[main] starting sender thread\n";
     std::thread networkThread(senderLoop, std::ref(sender));
 
     // simultaneously start the video streamer; uses an independent port
-    VideoStreamer video("192.168.1.9", 5001);
+    VideoStreamer video(cfg.baseIp, cfg.videoPort);
     std::cout << "[main] video streamer constructed\n";
     video.start();
     std::cout << "[main] video thread started\n";

@@ -36,6 +36,11 @@ Most of the heavy lifting of the base station software will be handled by GStrea
 ## Scripts
 Scripts will make or break the usability of Mora. In both development and deplyment, having to individually manage many devices is going to be a pain. We must be able to use scripts to deploy images to the Pis for development as well as to startup the system.
 
+# List of Software Dependencies
+- Gstreamer 1.0
+- libcamera
+- libyaml-cpp-dev
+
 ## Software notes
 
 ### Configs

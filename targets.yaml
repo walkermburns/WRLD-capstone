@@ -1,3 +1,8 @@
+global:
+  base:
+    LAN_IP: 192.168.1.9
+
+
 targets:
   - name: pi1
     host: walker@raspberrypi
@@ -8,3 +13,12 @@ targets:
   # - name: pi2
   #   host: pi@192.168.1.102
   #   path: /home/pi/buoy_app
+
+# Camera parameters – resolution, framerate, bitrate, encoder type.
+# IMU settings – sample rate, filter coefficients, calibration file
+# paths.
+# Network settings – local bind address, multicast groups, QoS.
+# Device paths – e.g. /dev/i2c-1 or GPIO pins for LEDs.
+# Node identifiers – numeric ID or name for logging/diagnostics.
+# Feature toggles – enable/disable video, IMU, debugging output, etc.
+# Security – encryption keys, authentication tokens.
