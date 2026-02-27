@@ -53,7 +53,7 @@ bool BNO055Driver::init()
     return true;
 }
 
-const IMUData_t &BNO055Driver::readSensor()
+const IMUData &BNO055Driver::readSensor()
 {
     uint8_t imu_data[12];
     if (!transport.readRegister(BNO055_regs::Register::ACC_DATA, imu_data,
@@ -69,13 +69,13 @@ const IMUData_t &BNO055Driver::readSensor()
     int16_t gyrY = (imu_data[9] << 8) | imu_data[8];
     int16_t gyrZ = (imu_data[11] << 8) | imu_data[10];
 
-    data.ax = accX * 0.01f;
-    data.ay = accY * 0.01f;
-    data.az = accZ * 0.01f;
+    data.accel.x = accX * 0.01f;
+    data.accel.y = accY * 0.01f;
+    data.accel.z = accZ * 0.01f;
 
-    data.gx = gyrX / 16.0f;
-    data.gy = gyrY / 16.0f;
-    data.gz = gyrZ / 16.0f;
+    data.gyro.x = gyrX / 16.0f;
+    data.gyro.y = gyrY / 16.0f;
+    data.gyro.z = gyrZ / 16.0f;
 
     uint8_t qdata[8];
     if (transport.readRegister(BNO055_regs::Register::QUA_DATA, qdata,
@@ -86,10 +86,10 @@ const IMUData_t &BNO055Driver::readSensor()
         int16_t qz = (qdata[7] << 8) | qdata[6];
 
         constexpr float scale = 1.0f / (1 << 14);
-        data.qw = qw * scale;
-        data.qx = qx * scale;
-        data.qy = qy * scale;
-        data.qz = qz * scale;
+        data.quat.w = qw * scale;
+        data.quat.x = qx * scale;
+        data.quat.y = qy * scale;
+        data.quat.z = qz * scale;
     }
 
     return data;

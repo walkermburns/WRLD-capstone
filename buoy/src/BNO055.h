@@ -16,9 +16,9 @@ public:
     BNO055Driver(const std::string &i2cDevice = "/dev/i2c-1", uint8_t address = 0x28);
 
     bool init() override;
-    const IMUData_t &readSensor() override;
+    const IMUData &readSensor() override;
 
 private:
     I2CTransport transport;
-    IMUData_t data;
+    IMUData data;
 };

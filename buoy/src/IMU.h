@@ -2,15 +2,24 @@
 
 #include <cstdint>
 
-// simple data container for readings produced by any IMU implementation.
-// keeping it POD allows it to be copied/stored in queues without hairy
-// ownership semantics.
+// small helper types make the intent clear and let you add utility methods
+struct Vec3 {
+    float x, y, z;
+};
 
-typedef struct {
-    float ax, ay, az;   // m/s^2
-    float gx, gy, gz;   // deg/s
-    float qw, qx, qy, qz; // unit quaternion
-} IMUData_t;
+struct Quaternion {
+    float w, x, y, z;
+};
+
+// primary data container used by all IMU drivers.  remains POD so it can be
+// copied into queues and sent over the network without any allocator or
+// ownership issues.
+struct IMUData {
+    Vec3 accel;        // m/s²
+    Vec3 gyro;         // °/s
+    Quaternion quat;   // unit
+};
+
 
 // abstract base class defining the public interface for all IMU drivers.
 // drivers such as BNO055 inherit from this so that higher‑level code can
@@ -26,5 +35,5 @@ public:
 
     // read the latest sample from the device.  The reference returned
     // remains valid until the next call to readSensor().
-    virtual const IMUData_t &readSensor() = 0;
+    virtual const IMUData &readSensor() = 0;
 };

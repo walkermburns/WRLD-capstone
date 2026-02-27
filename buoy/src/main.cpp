@@ -8,10 +8,11 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
 #include "buoy.pb.h"
 
 static std::atomic<bool> running{true};
-static std::queue<IMUData_t> imuQueue;
+static std::queue<IMUData> imuQueue;
 static std::mutex queueMutex;
 
 // =============================
@@ -21,7 +22,7 @@ void sensorLoop(IMUInterface &imu)
 {
     while (running)
     {
-        IMUData_t data = imu.readSensor();
+        IMUData data = imu.readSensor();
 
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -46,7 +47,7 @@ void senderLoop(const char* ip, int port)
 
     while (running)
     {
-        IMUData_t data;
+        IMUData data;
 
         {
             std::lock_guard<std::mutex> lock(queueMutex);
@@ -59,16 +60,16 @@ void senderLoop(const char* ip, int port)
 
         buoy_proto::IMU_proto msg;
 
-        msg.set_acc_x(data.ax);
-        msg.set_acc_y(data.ay);
-        msg.set_acc_z(data.az);
-        msg.set_gyr_x(data.gx);
-        msg.set_gyr_y(data.gy);
-        msg.set_gyr_z(data.gz);
-        msg.set_quat_w(data.qw);
-        msg.set_quat_x(data.qx);
-        msg.set_quat_y(data.qy);
-        msg.set_quat_z(data.qz);
+        msg.set_acc_x(data.accel.x);
+        msg.set_acc_y(data.accel.y);
+        msg.set_acc_z(data.accel.z);
+        msg.set_gyr_x(data.gyro.x);
+        msg.set_gyr_y(data.gyro.y);
+        msg.set_gyr_z(data.gyro.z);
+        msg.set_quat_w(data.quat.w);
+        msg.set_quat_x(data.quat.x);
+        msg.set_quat_y(data.quat.y);
+        msg.set_quat_z(data.quat.z);
 
         uint64_t ts = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -107,8 +108,14 @@ int main()
     std::thread sensorThread(sensorLoop, std::ref(imu));
     std::thread networkThread(senderLoop, "192.168.1.9", 5000);
 
-    std::this_thread::sleep_for(std::chrono::seconds(60));
-    running = false;
+    // instead of sleeping a fixed time, stay alive until a signal
+    // requests shutdown.  signal handler simply clears the atomic.
+    std::signal(SIGINT, [](int){ running = false; });
+    std::signal(SIGTERM, [](int){ running = false; });
+
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     sensorThread.join();
     networkThread.join();
