@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <csignal>
 #include "buoy.pb.h"
+#include "IMUProtoSender.h"
 
 static std::atomic<bool> running{true};
 static std::queue<IMUData> imuQueue;
@@ -36,15 +37,8 @@ void sensorLoop(IMUInterface &imu)
 // =============================
 // Sender Thread (UDP)
 // =============================
-void senderLoop(const char* ip, int port)
+void senderLoop(IMUProtoSender &sender)
 {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
     while (running)
     {
         IMUData data;
@@ -58,36 +52,8 @@ void senderLoop(const char* ip, int port)
             imuQueue.pop();
         }
 
-        buoy_proto::IMU_proto msg;
-
-        msg.set_acc_x(data.accel.x);
-        msg.set_acc_y(data.accel.y);
-        msg.set_acc_z(data.accel.z);
-        msg.set_gyr_x(data.gyro.x);
-        msg.set_gyr_y(data.gyro.y);
-        msg.set_gyr_z(data.gyro.z);
-        msg.set_quat_w(data.quat.w);
-        msg.set_quat_x(data.quat.x);
-        msg.set_quat_y(data.quat.y);
-        msg.set_quat_z(data.quat.z);
-
-        uint64_t ts = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-
-        msg.set_timestamp(ts);
-
-        std::string buffer;
-        msg.SerializeToString(&buffer);
-
-        sendto(sock,
-               buffer.data(),
-               buffer.size(),
-               0,
-               (sockaddr*)&addr,
-               sizeof(addr));
+        sender.sendIMU(data);
     }
-
-    close(sock);
 }
 
 // =============================
@@ -106,7 +72,10 @@ int main()
 
     // pass by reference to avoid slicing
     std::thread sensorThread(sensorLoop, std::ref(imu));
-    std::thread networkThread(senderLoop, "192.168.1.9", 5000);
+
+    // create sender instance and give it to the thread
+    IMUProtoSender sender("192.168.1.9", 5000);
+    std::thread networkThread(senderLoop, std::ref(sender));
 
     // instead of sleeping a fixed time, stay alive until a signal
     // requests shutdown.  signal handler simply clears the atomic.

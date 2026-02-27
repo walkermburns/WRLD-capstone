@@ -1,6 +1,7 @@
 targets:
   - name: pi1
     host: walker@raspberrypi
+    LAN_IP: 192.168.1.10
     path: "~/buoy/"
 
   # - name: pi2
