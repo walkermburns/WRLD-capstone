@@ -100,11 +100,13 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    // shutdown video immediately; other threads may still be finishing
+    video.stop();
+    std::cout << "[main] video stopped\n";
+
     sensorThread.join();
     networkThread.join();
     std::cout << "[main] imu & sender threads joined\n";
-    video.stop();
-    std::cout << "[main] video stopped\n";
 
     google::protobuf::ShutdownProtobufLibrary();
 }

@@ -37,12 +37,18 @@ void VideoStreamer::stop()
         return;
     std::cout << "[video] stopping thread\n";
     running_ = false;
+
+    // wake up the bus loop by setting pipeline to NULL; msg will appear
+    if (pipeline_) {
+        gst_element_send_event((GstElement*)pipeline_, gst_event_new_eos());
+        gst_element_set_state((GstElement*)pipeline_, GST_STATE_NULL);
+    }
+
     if (worker_.joinable())
         worker_.join();
 
     if (pipeline_) {
         std::cout << "[video] tearing down pipeline\n";
-        gst_element_set_state((GstElement*)pipeline_, GST_STATE_NULL);
         gst_object_unref(pipeline_);
         pipeline_ = nullptr;
     }
@@ -67,7 +73,7 @@ void VideoStreamer::threadFunc()
     GstBus *bus = gst_element_get_bus((GstElement*)pipeline_);
     while (running_) {
         GstMessage *msg = gst_bus_timed_pop_filtered(bus,
-                GST_CLOCK_TIME_NONE,
+                GST_MSECOND * 100,
                 static_cast<GstMessageType>(GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
         if (msg) {
             GError *err;
@@ -75,7 +81,7 @@ void VideoStreamer::threadFunc()
             switch (GST_MESSAGE_TYPE(msg)) {
             case GST_MESSAGE_ERROR:
                 gst_message_parse_error(msg, &err, &dbg);
-                std::cerr << "GStreamer error: " << err->message << std::endl;
+                std::cerr << "[video] GStreamer error: " << err->message << std::endl;
                 g_error_free(err);
                 g_free(dbg);
                 running_ = false;
@@ -88,6 +94,7 @@ void VideoStreamer::threadFunc()
             }
             gst_message_unref(msg);
         }
+        // timed pop allows the loop to wake every 100ms and check running_
     }
     gst_object_unref(bus);
 }
