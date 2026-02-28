@@ -4,6 +4,8 @@
 #include <unistd.h>
 #include <iostream>
 #include <iomanip>   // for setw, left
+#include <unordered_map>
+#include <chrono>
 
 // static member definitions
 std::mutex BuoyNode::printMutex;
@@ -14,8 +16,17 @@ BuoyNode::BuoyNode(std::string name, int imuPort, Callback cb)
 {
 }
 
+BuoyNode::BuoyNode(std::string name, int imuPort)
+    : BuoyNode(std::move(name), imuPort, BuoyNode::printMessage)
+{
+}
+
 BuoyNode::~BuoyNode()
 {
+    // ensure we leave the socket in a clean state; stop() is idempotent and
+    // safe to call even if start() failed or was never invoked.  the member
+    // variable will be reset and the internal thread (if any) joined before
+    // destruction.
     stop();
 }
 
@@ -29,6 +40,28 @@ bool BuoyNode::start()
         perror("socket");
         return false;
     }
+
+    // make the address/port reusable immediately after the socket is closed
+    // (even if the previous owner crashed or is stuck in TIME_WAIT).
+    // SO_REUSEADDR is generally sufficient for UDP; on some platforms
+    // SO_REUSEPORT allows multiple listeners on the same port if desired.
+    int opt = 1;
+    if (setsockopt(sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt(SO_REUSEADDR)");
+        // non-fatal: continue without reuse
+    }
+#ifdef SO_REUSEPORT
+    if (setsockopt(sock_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt(SO_REUSEPORT)");
+        // not fatal; not all systems support it
+    }
+#endif
+
+    // optionally make the socket non‑blocking so that a stray recv can't hang
+    // the thread; the shutdown logic already makes recv return with error
+    // so this is just defensive.  if non-blocking is used the receiveLoop
+    // would need to handle EAGAIN/EWOULDBLOCK (currently it does not).
+    // fcntl(sock_, F_SETFL, O_NONBLOCK);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -101,7 +134,19 @@ void BuoyNode::receiveLoop()
 void BuoyNode::printMessage(const std::string &name,
                             const buoy_proto::IMU_proto &msg)
 {
+    // throttle to at most one print per-node every 500ms.  the same mutex that
+    // protects the iostream ensures the map is safe too.
     std::lock_guard<std::mutex> lock(printMutex);
+
+    using Clock = std::chrono::steady_clock;
+    static std::unordered_map<std::string, Clock::time_point> lastPrint;
+
+    auto now = Clock::now();
+    auto it = lastPrint.find(name);
+    if (it != lastPrint.end() && now - it->second < std::chrono::milliseconds(500)) {
+        return; // skip this message
+    }
+    lastPrint[name] = now;
 
     const int W = 8;
     std::cout << '[' << name << "]\n";

@@ -17,7 +17,12 @@ public:
     using Callback = std::function<void(const std::string &name,
                                         const buoy_proto::IMU_proto &msg)>;
 
+    // normal constructor takes a callback; for common use cases the
+    // instance will simply print received messages with optional throttling.
+    // this overload users the static printMessage helper directly so callers
+    // can omit the callback entirely.
     BuoyNode(std::string name, int imuPort, Callback cb);
+    BuoyNode(std::string name, int imuPort);
     ~BuoyNode();
 
     // helper that prints a message in the preferred multiline, aligned
