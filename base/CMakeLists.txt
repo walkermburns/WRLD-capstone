@@ -47,9 +47,11 @@ target_link_libraries(gl_composite_test
         m              # Math library
 )
 # base station executable listens for protobuf messages from each buoy
-add_executable(base_station main.cpp Config.cpp BuoyNode.cpp)
+add_executable(base_station main.cpp Config.cpp BuoyNode.cpp VideoComposite.cpp)
 
+# VideoComposite (and main.cpp) requires GStreamer headers and libs
 target_link_libraries(base_station PRIVATE 
     proto_lib
     yaml-cpp::yaml-cpp
+    PkgConfig::GST
 )

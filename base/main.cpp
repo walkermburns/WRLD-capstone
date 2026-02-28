@@ -9,6 +9,7 @@
 #include "Config.h"
 #include "BuoyNode.h"
 #include "buoy.pb.h"
+#include "VideoComposite.h"
 
 static std::atomic<bool> running{true};
 
@@ -38,6 +39,14 @@ int main()
         } else {
             std::cerr << "[main] failed to start node " << n.name << "\n";
         }
+    }
+
+    try {
+        VideoComposite vc;
+        vc.start();
+    } catch (const std::exception &e) {
+        std::cerr << "VideoComposite error: " << e.what() << "\n";
+        return -1;
     }
 
     // signal handling to allow clean shutdown.  the handler is intentionally
