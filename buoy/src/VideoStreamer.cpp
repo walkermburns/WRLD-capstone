@@ -1,6 +1,7 @@
 #include "VideoStreamer.h"
 #include <gst/gst.h>
 #include <iostream>
+#include <pthread.h>
 
 VideoStreamer::VideoStreamer(const std::string &dstIp, int dstPort)
 {
@@ -56,6 +57,7 @@ void VideoStreamer::stop()
 
 void VideoStreamer::threadFunc()
 {
+    pthread_setname_np(pthread_self(), "video");
     GError *error = nullptr;
     std::cout << "[video] threadFunc creating pipeline\n";
     pipeline_ = gst_parse_launch(pipelineDesc_.c_str(), &error);

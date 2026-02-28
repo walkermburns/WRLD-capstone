@@ -13,16 +13,20 @@
 #include "IMUProtoSender.h"
 #include "VideoStreamer.h"
 #include "Config.h"
+#include <condition_variable>
+#include <pthread.h>
 
 static std::atomic<bool> running{true};
 static std::queue<IMUData> imuQueue;
 static std::mutex queueMutex;
+static std::condition_variable dataCv;
 
 // =============================
 // Sensor Thread (100 Hz)
 // =============================
 void sensorLoop(IMUInterface &imu)
 {
+    pthread_setname_np(pthread_self(), "sensor");
     std::cout << "[sensor] started\n";
     while (running)
     {
@@ -32,6 +36,7 @@ void sensorLoop(IMUInterface &imu)
             std::lock_guard<std::mutex> lock(queueMutex);
             imuQueue.push(data);
         }
+        dataCv.notify_one();
 
         usleep(10000); // 100 Hz
     }
@@ -43,15 +48,19 @@ void sensorLoop(IMUInterface &imu)
 // =============================
 void senderLoop(IMUProtoSender &sender)
 {
+    pthread_setname_np(pthread_self(), "sender");
     std::cout << "[sender] started\n";
     while (running)
     {
         IMUData data;
-
         {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            if (imuQueue.empty())
-                continue;
+            std::unique_lock<std::mutex> lock(queueMutex);
+            dataCv.wait(lock, []{
+                return !imuQueue.empty() || !running;
+            });
+
+            if (!running && imuQueue.empty())
+                break;
 
             data = imuQueue.front();
             imuQueue.pop();
