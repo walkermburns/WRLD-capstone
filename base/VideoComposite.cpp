@@ -126,19 +126,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         "sink_2::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 "
         "sink_3::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! "
         "glcolorconvert ! "
-        "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=true "
-        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens0 ! gltransformation name=stab0 ! mix.sink_0 "
-        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens1 ! gltransformation name=stab1 ! mix.sink_1 "
-        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens2 ! gltransformation name=stab2 ! mix.sink_2 "
-        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens3 ! gltransformation name=stab3 ! mix.sink_3";
+        "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=true ";
 
     self->pipeline = gst_parse_launch(pipeline_str, &error);
     if (error != NULL) {
@@ -147,6 +135,87 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         return NULL;
     }
 
+    /* obtain the mixer so we can attach branches to it */
+    GstElement *mix = gst_bin_get_by_name(GST_BIN(self->pipeline), "mix");
+    if (!mix) {
+        g_printerr("run_pipeline: mixer element not found\n");
+        return NULL;
+    }
+
+    /* create four videotestsrc -> ... -> gltransformation branches in code */
+    for (int i = 0; i < 4; ++i) {
+        GstElement *src   = gst_element_factory_make("videotestsrc", NULL);
+        GstElement *rate  = gst_element_factory_make("videorate", NULL);
+        GstElement *caps1 = gst_element_factory_make("capsfilter", NULL);
+        GstElement *caps2 = gst_element_factory_make("capsfilter", NULL);
+        GstElement *glup  = gst_element_factory_make("glupload", NULL);
+        char shader_nm[16], stab_nm[16];
+        snprintf(shader_nm, sizeof(shader_nm), "lens%d", i);
+        snprintf(stab_nm, sizeof(stab_nm), "stab%d", i);
+        GstElement *shader = gst_element_factory_make("glshader", shader_nm);
+        GstElement *stab   = gst_element_factory_make("gltransformation", stab_nm);
+
+        if (!src || !rate || !caps1 || !caps2 || !glup || !shader || !stab) {
+            g_printerr("run_pipeline: failed to create branch %d elements\n", i);
+            return NULL;
+        }
+
+        /* configure elements exactly as in the original string */
+        g_object_set(src, "pattern", (i < 2) ? 0 : 1, NULL);
+        GstCaps *c1 = gst_caps_from_string(
+            "video/x-raw,width=1920,height=1080,framerate=30/1");
+        GstCaps *c2 = gst_caps_from_string(
+            "video/x-raw,framerate=60/1");
+        g_object_set(caps1, "caps", c1, NULL);
+        g_object_set(caps2, "caps", c2, NULL);
+        gst_caps_unref(c1);
+        gst_caps_unref(c2);
+
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                         src, caps1, rate, caps2, glup, shader, stab, NULL);
+
+        /* link step-by-step to diagnose failures if any */
+        if (!gst_element_link(src, caps1)) {
+            g_printerr("run_pipeline: src->caps1 link failed on branch %d\n", i);
+            return NULL;
+        }
+        if (!gst_element_link(caps1, rate)) {
+            g_printerr("run_pipeline: caps1->rate link failed on branch %d\n", i);
+            return NULL;
+        }
+        if (!gst_element_link(rate, caps2)) {
+            g_printerr("run_pipeline: rate->caps2 link failed on branch %d\n", i);
+            return NULL;
+        }
+        if (!gst_element_link_many(caps2, glup, shader, stab, NULL)) {
+            g_printerr("run_pipeline: caps2->glup/shader/stab link failed on branch %d\n", i);
+            return NULL;
+        }
+
+        GstPad *sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
+        if (!sinkpad) {
+            g_printerr("run_pipeline: could not get mixer pad for branch %d\n", i);
+            return NULL;
+        }
+
+        /* set pad properties for positioning */
+        g_object_set(sinkpad,
+                     "xpos",   (i & 1) ? 1920 : 0,
+                     "ypos",   (i & 2) ? 1080 : 0,
+                     "width",  1920,
+                     "height", 1080,
+                     NULL);
+
+        GstPad *srcpad = gst_element_get_static_pad(stab, "src");
+        if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
+            g_printerr("run_pipeline: failed to link branch %d to mixer\n", i);
+            return NULL;
+        }
+        gst_object_unref(srcpad);
+        gst_object_unref(sinkpad);
+    }
+
+    /* shaders and stabs can still be configured by name */
     for (int i = 0; i < 4; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
