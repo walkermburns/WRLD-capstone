@@ -4,6 +4,7 @@
 #include <gst/gst.h>
 #include <gst/gl/gl.h> // for GstGLShader
 #include <string>
+#include <vector>
 
 class VideoComposite {
 public:
@@ -16,10 +17,10 @@ public:
 
 private:
     GstElement *pipeline;
-    GstElement *stab[4];
+    std::vector<GstElement*> stab;   // stabilization elements, one per source
 
     // configuration
-    int num_sinks;                  // number of mixer sinks/branches
+    int num_src;                    // number of mixer sources/branches
     GstStructure *uniforms;         // shared k1/zoom structure for shaders
 
     // path/content of the distortion shader

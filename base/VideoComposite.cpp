@@ -14,7 +14,7 @@ VideoComposite *VideoComposite::s_instance = nullptr;
 
 VideoComposite::VideoComposite(const std::string &shaderPath)
     : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f),
-      num_sinks(3), uniforms(nullptr) {
+      num_src(3), uniforms(nullptr), stab() {
     // load shader file
     std::ifstream in(shaderPath);
     if (!in) {
@@ -26,8 +26,9 @@ VideoComposite::VideoComposite(const std::string &shaderPath)
     if (shader_code.empty()) {
         throw std::runtime_error("shader file " + shaderPath + " is empty");
     }
-    for (int i = 0; i < 4; ++i)
-        stab[i] = nullptr;
+    /* allocate and clear vector to match num_src; entries beyond
+       num_src are not used */
+    stab.assign(num_src, nullptr);
 
     /* prepare the uniforms structure once and reuse it */
     uniforms = gst_structure_new("uniforms",
@@ -39,8 +40,9 @@ VideoComposite::VideoComposite(const std::string &shaderPath)
 VideoComposite::~VideoComposite() {
     if (pipeline) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
-        for(int i=0;i<4;i++){
-            if(stab[i]) gst_object_unref(stab[i]);
+        /* unref only the entries we actually created */
+        for (int i = 0; i < num_src && i < (int)stab.size(); i++) {
+            if (stab[i]) gst_object_unref(stab[i]);
         }
         gst_object_unref(pipeline);
     }
@@ -103,7 +105,7 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     self->setUniforms(k1, zoom);
 
     /* push updated uniforms into all shader elements */
-    for (int i = 0; i < self->num_sinks; i++) {
+    for (int i = 0; i < self->num_src; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
         GstElement *shader = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
@@ -113,7 +115,7 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
         }
     }
 
-    for (int i = 0; i < self->num_sinks; i++) {
+    for (int i = 0; i < self->num_src && i < (int)self->stab.size(); i++) {
         if (self->stab[i]) {
             g_object_set(self->stab[i],
                          "translation-x", sway_x,
@@ -177,8 +179,8 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     /* dynamic configuration for mixer sinks; change values or number here */
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
-    layouts.reserve(self->num_sinks);
-    for (int i = 0; i < self->num_sinks; ++i) {
+    layouts.reserve(self->num_src);
+    for (int i = 0; i < self->num_src; ++i) {
         /* arrange sinks end-to-end horizontally; each occupies a 1920x1080 block */
         SinkLayout l;
         l.xpos   = i * 1920;
@@ -197,7 +199,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     }
 
     /* create videotestsrc branches and hook them to mixer pads */
-    for (int i = 0; i < self->num_sinks; ++i) {
+    for (int i = 0; i < self->num_src; ++i) {
         GstElement *src   = gst_element_factory_make("videotestsrc", NULL);
         GstElement *rate  = gst_element_factory_make("videorate", NULL);
         GstElement *caps1 = gst_element_factory_make("capsfilter", NULL);
@@ -260,8 +262,8 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         gst_object_unref(sinkpad);
     }
 
-    /* shaders and stabs can still be configured by name; use num_sinks */
-    for (int i = 0; i < self->num_sinks; i++) {
+    /* shaders and stabs can still be configured by name; use num_src */
+    for (int i = 0; i < self->num_src; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
         GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
@@ -272,18 +274,12 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         }
     }
 
-    /* update stab pointers; clear any remaining entries */
-    for (int i = 0; i < 4; ++i) {
-        if (i < self->num_sinks) {
-            char name[16];
-            snprintf(name, sizeof(name), "stab%d", i);
-            self->stab[i] = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
-        } else {
-            if (self->stab[i]) {
-                gst_object_unref(self->stab[i]);
-                self->stab[i] = nullptr;
-            }
-        }
+    /* update stab pointers vector to match current num_src */
+    self->stab.assign(self->num_src, nullptr);
+    for (int i = 0; i < self->num_src; ++i) {
+        char name[16];
+        snprintf(name, sizeof(name), "stab%d", i);
+        self->stab[i] = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
     }
 
 
@@ -294,8 +290,8 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     g_main_loop_run(loop);
 
     gst_element_set_state(self->pipeline, GST_STATE_NULL);
-    for(int i=0;i<4;i++){
-        if(self->stab[i]) gst_object_unref(self->stab[i]);
+    for (auto *s : self->stab) {
+        if (s) gst_object_unref(s);
     }
     gst_object_unref(self->pipeline);
     g_main_loop_unref(loop);
