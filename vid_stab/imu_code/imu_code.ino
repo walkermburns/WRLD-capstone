@@ -10,7 +10,7 @@ const uint32_t PERIOD_US = 5000;   // 1/200 s --> us
 static uint32_t next_us = 0;
 
 // 100 Hz print
-const uint32_t PRINT_MS = 10;      // 1/20 s --> ms
+const uint32_t PRINT_MS = 20;      // 1/50 s --> ms
 static uint32_t next_print_ms = 0;
 
 struct Quat {float w, x, y, z; };
@@ -75,13 +75,13 @@ void loop() {
     // Serial.print("yaw:");
     Serial.print(rad2deg(yaw), 2); 
     Serial.print(",");
-    Serial.print(q.w, 2);
+    Serial.print(q.w, 6);
     Serial.print(",");
-    Serial.print(q.x, 2);
+    Serial.print(q.x, 6);
     Serial.print(",");
-    Serial.print(q.y, 2);
+    Serial.print(q.y, 6);
     Serial.print(",");
-    Serial.println(q.z, 2);
+    Serial.println(q.z, 6);
 
 
   }

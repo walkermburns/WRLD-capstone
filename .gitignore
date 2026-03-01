@@ -2,3 +2,5 @@
 ./build/
 buoy/src/configs
 /build
+.venv
+vid_stab/cpp/build/
