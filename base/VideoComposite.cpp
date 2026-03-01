@@ -14,6 +14,8 @@ VideoComposite *VideoComposite::s_instance = nullptr;
 
 VideoComposite::VideoComposite(const std::string &shaderPath)
     : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f),
+      // default to four incoming UDP streams; we add a separate background
+      // videotestsrc below rather than counting it here.
       num_src(3), uniforms(nullptr), stab() {
     // load shader file
     std::ifstream in(shaderPath);
@@ -176,19 +178,24 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
 
     /* we'll use mix pointer below when attaching branches */
 
-    /* dynamic configuration for mixer sinks; change values or number here */
+    /* dynamic configuration for mixer sinks; change values or number here
+       we want a 2x2 grid for the UDP sources and a full‑screen background test
+       pattern.  The background element is created separately below. */
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
     layouts.reserve(self->num_src);
     for (int i = 0; i < self->num_src; ++i) {
-        /* arrange sinks end-to-end horizontally; each occupies a 1920x1080 block */
+        /* compute side-by-side horizontal layout */
         SinkLayout l;
-        l.xpos   = i * 1920;
-        l.ypos   = 0;
-        l.width  = 1920;
-        l.height = 1080;
+        l.xpos  = i * 1920;  // each stream offset horizontally
+        l.ypos  = 0;
+        l.width = 1920;
+        l.height= 1080;
         layouts.push_back(l);
     }
+    /* background resolution should cover all sources horizontally */
+    gint bg_width = self->num_src * 1920;
+    gint bg_height = 1080; // match individual source height
 
     /* add pad probe to mixer src so we can update IMU/uniforms per frame */
     GstPad *probe_pad = gst_element_get_static_pad(mix, "src");
@@ -198,42 +205,94 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         gst_object_unref(probe_pad);
     }
 
-    /* create videotestsrc branches and hook them to mixer pads */
-    for (int i = 0; i < self->num_src; ++i) {
-        GstElement *src   = gst_element_factory_make("videotestsrc", NULL);
-        GstElement *rate  = gst_element_factory_make("videorate", NULL);
-        GstElement *caps1 = gst_element_factory_make("capsfilter", NULL);
-        GstElement *caps2 = gst_element_factory_make("capsfilter", NULL);
-        GstElement *glup  = gst_element_factory_make("glupload", NULL);
-        char shader_nm[16], stab_nm[16];
-        snprintf(shader_nm, sizeof(shader_nm), "lens%d", i);
-        snprintf(stab_nm, sizeof(stab_nm), "stab%d", i);
-        GstElement *shader = gst_element_factory_make("glshader", shader_nm);
-        GstElement *stab   = gst_element_factory_make("gltransformation", stab_nm);
+    /*--- background branch ------------------------------------------------*/
+    {
+        GstElement *bg_src   = gst_element_factory_make("videotestsrc", "bg_src");
+        GstElement *bg_caps  = gst_element_factory_make("capsfilter", "bg_caps");
+        GstElement *bg_glup  = gst_element_factory_make("glupload", "bg_glup");
+        if (!bg_src || !bg_caps || !bg_glup) {
+            g_printerr("run_pipeline: failed to create background elements\n");
+            return NULL;
+        }
+        g_object_set(bg_src, "pattern", 0, "is-live", TRUE, NULL);
+        GstCaps *bgcaps = gst_caps_from_string(
+            (std::ostringstream() << "video/x-raw,width=" << bg_width
+             << ",height=" << bg_height << ",framerate=60/1").str().c_str());
+        g_object_set(bg_caps, "caps", bgcaps, NULL);
+        gst_caps_unref(bgcaps);
 
-        if (!src || !rate || !caps1 || !caps2 || !glup || !shader || !stab) {
-            g_printerr("run_pipeline: failed to create branch %d elements\n", i);
+        gst_bin_add_many(GST_BIN(self->pipeline), bg_src, bg_caps, bg_glup, NULL);
+        if (!gst_element_link_many(bg_src, bg_caps, bg_glup, NULL)) {
+            g_printerr("run_pipeline: failed to link background branch\n");
             return NULL;
         }
 
-        g_object_set(src, "pattern", (i < 2) ? 0 : 1, NULL);
-        GstCaps *c1 = gst_caps_from_string(
-            "video/x-raw,width=1920,height=1080,framerate=30/1");
-        GstCaps *c2 = gst_caps_from_string(
-            "video/x-raw,framerate=60/1");
-        g_object_set(caps1, "caps", c1, NULL);
-        g_object_set(caps2, "caps", c2, NULL);
-        gst_caps_unref(c1);
-        gst_caps_unref(c2);
+        GstPad *bg_sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
+        if (!bg_sinkpad) {
+            g_printerr("run_pipeline: could not get mixer pad for background\n");
+            return NULL;
+        }
+        g_object_set(bg_sinkpad,
+                     "xpos", 0,
+                     "ypos", 0,
+                     "width", bg_width,
+                     "height", bg_height,
+                     "zorder", 0,
+                     NULL);
+        GstPad *bg_srcpad = gst_element_get_static_pad(bg_glup, "src");
+        if (gst_pad_link(bg_srcpad, bg_sinkpad) != GST_PAD_LINK_OK) {
+            g_printerr("run_pipeline: failed to link background to mixer\n");
+            return NULL;
+        }
+        gst_object_unref(bg_srcpad);
+        gst_object_unref(bg_sinkpad);
+    }
+
+    /* create udp source branches and hook them to mixer pads */
+    for (int i = 0; i < self->num_src; ++i) {
+        GstElement *udpsrc    = gst_element_factory_make("udpsrc", NULL);
+        GstElement *jitter    = gst_element_factory_make("rtpjitterbuffer", NULL);
+        GstElement *depay     = gst_element_factory_make("rtph264depay", NULL);
+        GstElement *parse     = gst_element_factory_make("h264parse", NULL);
+        GstElement *dec       = gst_element_factory_make("avdec_h264", NULL);
+        GstElement *conv      = gst_element_factory_make("videoconvert", NULL);
+        GstElement *rate      = gst_element_factory_make("videorate", NULL);
+        GstElement *capsf     = gst_element_factory_make("capsfilter", NULL);
+        GstElement *glup      = gst_element_factory_make("glupload", NULL);
+        char shader_nm[16], stab_nm[16];
+        snprintf(shader_nm, sizeof(shader_nm), "lens%d", i);
+        snprintf(stab_nm, sizeof(stab_nm), "stab%d", i);
+        GstElement *shader    = gst_element_factory_make("glshader", shader_nm);
+        GstElement *stab      = gst_element_factory_make("gltransformation", stab_nm);
+        GstElement *queue     = gst_element_factory_make("queue", NULL);
+
+        if (!udpsrc || !jitter || !depay || !parse || !dec || !conv ||
+            !rate || !capsf || !glup || !shader || !stab || !queue) {
+            g_printerr("run_pipeline: failed to create udp branch %d elements\n", i);
+            return NULL;
+        }
+
+        /* configure udp source and RTP caps */
+        g_object_set(udpsrc, "port", 5101 + i, NULL);
+        GstCaps *rtpcaps = gst_caps_from_string(
+            "application/x-rtp,media=video,encoding-name=H264,"
+            "payload=96,clock-rate=90000");
+        g_object_set(udpsrc, "caps", rtpcaps, NULL);
+        gst_caps_unref(rtpcaps);
+        g_object_set(jitter, "latency", 50, "drop-on-latency", TRUE, NULL);
+
+        GstCaps *caps2 = gst_caps_from_string("video/x-raw,framerate=60/1");
+        g_object_set(capsf, "caps", caps2, NULL);
+        gst_caps_unref(caps2);
 
         gst_bin_add_many(GST_BIN(self->pipeline),
-                         src, caps1, rate, caps2, glup, shader, stab, NULL);
+                         udpsrc, jitter, depay, parse, dec,
+                         conv, rate, capsf, glup, shader, stab, queue, NULL);
 
-        if (!gst_element_link(src, caps1) ||
-            !gst_element_link(caps1, rate) ||
-            !gst_element_link(rate, caps2) ||
-            !gst_element_link_many(caps2, glup, shader, stab, NULL)) {
-            g_printerr("run_pipeline: branch %d link failed\n", i);
+        if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec,
+                                   conv, rate, capsf, glup, shader, stab,
+                                   queue, NULL)) {
+            g_printerr("run_pipeline: udp branch %d link failed\n", i);
             return NULL;
         }
 
@@ -253,12 +312,16 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
                      "height", l.height,
                      NULL);
 
-        GstPad *srcpad = gst_element_get_static_pad(stab, "src");
+        /* link the *queue* output, not the stab element; queue is last in
+           the branch chain so it provides a stable src pad for the mixer */
+        GstPad *srcpad = gst_element_get_static_pad(queue, "src");
         if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
             g_printerr("run_pipeline: failed to link branch %d to mixer\n", i);
             return NULL;
         }
         gst_object_unref(srcpad);
+        /* set ordering so background stays at bottom */
+        g_object_set(sinkpad, "zorder", i + 1, NULL);
         gst_object_unref(sinkpad);
     }
 
