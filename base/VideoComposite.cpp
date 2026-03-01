@@ -121,24 +121,21 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     // build the pipeline string without embedded "//" comments
     const gchar *pipeline_str =
         "glvideomixer name=mix background=1 "
-        "sink_0::xpos=0 sink_0::ypos=0 sink_0::width=1920 sink_0::height=1080 "
-        "sink_1::xpos=1920 sink_1::ypos=0 sink_1::width=1920 sink_1::height=1080 "
-        "sink_2::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 "
-        "sink_3::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! "
+        "sink_0::zorder=0 "
+        "sink_1::xpos=0 sink_0::ypos=0 sink_0::width=1920 sink_0::height=1080 "
+        "sink_2::xpos=1920 sink_1::ypos=0 sink_1::width=1920 sink_1::height=1080 "
+        "sink_3::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 "
+        "sink_4::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! "
         "glcolorconvert ! "
-        "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=true "
-        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens0 ! gltransformation name=stab0 ! mix.sink_0 "
-        "videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens1 ! gltransformation name=stab1 ! mix.sink_1 "
-        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens2 ! gltransformation name=stab2 ! mix.sink_2 "
-        "videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 "
-            "! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
-            "glshader name=lens3 ! gltransformation name=stab3 ! mix.sink_3";
+        "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=false "
+        "videotestsrc is-live=true pattern=0 ! video/x-raw,width=3840,height=2160,framerate=60/1 ! glupload ! mix.sink_0 "
+        "udpsrc port=5101 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens0 ! gltransformation name=stab0 ! queue ! mix.sink_1 "
+        "udpsrc port=5102 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+            "glshader name=lens1 ! gltransformation name=stab1 ! queue ! mix.sink_2 "
+        "udpsrc port=5103 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+            "glshader name=lens2 ! gltransformation name=stab2 ! queue ! mix.sink_3 "
+        "udpsrc port=5104 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+            "glshader name=lens3 ! gltransformation name=stab3 ! queue ! mix.sink_4";
 
     self->pipeline = gst_parse_launch(pipeline_str, &error);
     if (error != NULL) {
