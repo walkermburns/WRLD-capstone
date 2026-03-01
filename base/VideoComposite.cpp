@@ -16,7 +16,7 @@ VideoComposite::VideoComposite(const std::string &shaderPath)
     : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f),
       // default to four incoming UDP streams; we add a separate background
       // videotestsrc below rather than counting it here.
-      num_src(3), uniforms(nullptr), stab() {
+      num_src(2), uniforms(nullptr), stab() {
     // load shader file
     std::ifstream in(shaderPath);
     if (!in) {
@@ -279,7 +279,9 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
             "payload=96,clock-rate=90000");
         g_object_set(udpsrc, "caps", rtpcaps, NULL);
         gst_caps_unref(rtpcaps);
-        g_object_set(jitter, "latency", 50, "drop-on-latency", TRUE, NULL);
+        // increase latency if there are issues, higher latency will cause frame
+        // drop and desync if source is delayed or doesn't exist.
+        g_object_set(jitter, "latency", 0, "drop-on-latency", TRUE, NULL);
 
         GstCaps *caps2 = gst_caps_from_string("video/x-raw,framerate=60/1");
         g_object_set(capsf, "caps", caps2, NULL);
