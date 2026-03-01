@@ -29,10 +29,11 @@ private:
     float live_k1;
     float live_zoom;
 
-    static gboolean update_fake_imu_cb(gpointer user_data);
     static gboolean on_draw_signal(GstElement *glfilter, GstGLShader *shader,
                                    guint texture, guint width, guint height,
                                    gpointer user_data);
+    static GstPadProbeReturn imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
+                                          gpointer user_data);
 
     // helper setters
     void setUniforms(float k1, float zoom);

@@ -82,31 +82,27 @@ void VideoComposite::setUniforms(float k1, float zoom) {
 
 // static callbacks ----------------------------------------------------------
 
-gboolean VideoComposite::on_draw_signal(GstElement *glfilter, GstGLShader *shader,
-                                        guint texture, guint width, guint height,
-                                        gpointer user_data) {
-    VideoComposite *self = static_cast<VideoComposite *>(user_data);
-    gst_gl_shader_set_uniform_1f(shader, "k1", self->live_k1);
-    gst_gl_shader_set_uniform_1f(shader, "zoom", self->live_zoom);
-    return FALSE;
-}
+/* pad probe that runs once for each buffer passing through the mixer source.
+   We use it to update fake IMU state and propagate uniforms/transforms. */
 
-
-gboolean VideoComposite::update_fake_imu_cb(gpointer user_data) {
+GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
+                                               gpointer user_data) {
+    if (!(info->type & GST_PAD_PROBE_TYPE_BUFFER))
+        return GST_PAD_PROBE_OK;
     VideoComposite *self = static_cast<VideoComposite *>(user_data);
+
     static float time_t = 0.0f;
     time_t += 0.1f;
 
     gfloat sway_x = sin(time_t) * 0.1f;
     gfloat sway_y = cos(time_t * 0.5f) * 0.05f;
-    gfloat rotation = sin(time_t * 0.8f) * 5.0f;
 
     float k1 = 0.3f + (sin(time_t) * 1.0f);
     float zoom = 1.1f;
 
-    /* update the shared structure instead of creating a new one */
     self->setUniforms(k1, zoom);
 
+    /* push updated uniforms into all shader elements */
     for (int i = 0; i < self->num_sinks; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
@@ -120,12 +116,12 @@ gboolean VideoComposite::update_fake_imu_cb(gpointer user_data) {
     for (int i = 0; i < self->num_sinks; i++) {
         if (self->stab[i]) {
             g_object_set(self->stab[i],
-                "translation-x", sway_x,
-                "translation-y", sway_y,
-                NULL);
+                         "translation-x", sway_x,
+                         "translation-y", sway_y,
+                         NULL);
         }
     }
-    return TRUE;
+    return GST_PAD_PROBE_OK;
 }
 
 void *VideoComposite::run_pipeline(gpointer user_data) {
@@ -190,6 +186,14 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         l.width  = 1920;
         l.height = 1080;
         layouts.push_back(l);
+    }
+
+    /* add pad probe to mixer src so we can update IMU/uniforms per frame */
+    GstPad *probe_pad = gst_element_get_static_pad(mix, "src");
+    if (probe_pad) {
+        gst_pad_add_probe(probe_pad, GST_PAD_PROBE_TYPE_BUFFER,
+                          imu_probe_cb, self, NULL);
+        gst_object_unref(probe_pad);
     }
 
     /* create videotestsrc branches and hook them to mixer pads */
@@ -263,7 +267,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
         if (shader_elem) {
             g_object_set(shader_elem, "fragment", self->shader_code.c_str(), NULL);
-            g_signal_connect(shader_elem, "update-shader", G_CALLBACK(on_draw_signal), self);
+            /* no signals; uniforms will be updated via pad probe each frame */
             gst_object_unref(shader_elem);
         }
     }
@@ -282,7 +286,6 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         }
     }
 
-    g_timeout_add(16, update_fake_imu_cb, self);
 
     gst_element_set_state(self->pipeline, GST_STATE_PLAYING);
 
