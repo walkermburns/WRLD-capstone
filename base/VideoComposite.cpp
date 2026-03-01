@@ -120,21 +120,39 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
 
     // build the pipeline string without embedded "//" comments
     const gchar *pipeline_str =
+        /* mixer with four zoned sinks laid out in a 2×2 grid */
         "glvideomixer name=mix background=1 "
-        "sink_0::zorder=0 "
-        "sink_1::xpos=0 sink_0::ypos=0 sink_0::width=1920 sink_0::height=1080 "
-        "sink_2::xpos=1920 sink_1::ypos=0 sink_1::width=1920 sink_1::height=1080 "
-        "sink_3::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 "
-        "sink_4::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! "
+            "sink_0::zorder=0 "
+            "sink_1::xpos=0  sink_1::ypos=0   sink_1::width=1920 sink_1::height=1080 sink_1::zorder=1 "
+            "sink_2::xpos=1920 sink_2::ypos=0   sink_2::width=1920 sink_2::height=1080 sink_2::zorder=2 "
+            "sink_3::xpos=0  sink_3::ypos=1080  sink_3::width=1920 sink_3::height=1080 sink_3::zorder=3 "
+            "sink_4::xpos=1920 sink_4::ypos=1080  sink_4::width=1920 sink_4::height=1080 sink_4::zorder=4 ! "
+        /* output to screen */
         "glcolorconvert ! "
-        "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=false "
-        "videotestsrc is-live=true pattern=0 ! video/x-raw,width=3840,height=2160,framerate=60/1 ! glupload ! mix.sink_0 "
-        "udpsrc port=5101 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens0 ! gltransformation name=stab0 ! queue ! mix.sink_1 "
-        "udpsrc port=5102 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "fpsdisplaysink video-sink=autovideosink sync=false "
+        /* test source in upper‑left of the mixer */
+        "videotestsrc is-live=true pattern=0 ! "
+            "video/x-raw,width=3840,height=2160,framerate=60/1 ! glupload ! mix.sink_0 "
+        /* four RTP/H264 inputs, each through a shader+stabiliser queue */
+        "udpsrc port=5101 caps=\"application/x-rtp,media=video,encoding-name=H264,"
+                    "payload=96,clock-rate=90000\" ! "
+            "rtpjitterbuffer latency=50 drop-on-latency=true ! rtph264depay ! h264parse ! avdec_h264 ! "
+            "videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+            "glshader name=lens0 ! gltransformation name=stab0 ! queue ! mix.sink_1 "
+        "udpsrc port=5102 caps=\"application/x-rtp,media=video,encoding-name=H264,"
+                    "payload=96,clock-rate=90000\" ! "
+            "rtpjitterbuffer latency=50 drop-on-latency=true ! rtph264depay ! h264parse ! avdec_h264 ! "
+            "videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
             "glshader name=lens1 ! gltransformation name=stab1 ! queue ! mix.sink_2 "
-        "udpsrc port=5103 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "udpsrc port=5103 caps=\"application/x-rtp,media=video,encoding-name=H264,"
+                    "payload=96,clock-rate=90000\" ! "
+            "rtpjitterbuffer latency=50 drop-on-latency=true ! rtph264depay ! h264parse ! avdec_h264 ! "
+            "videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
             "glshader name=lens2 ! gltransformation name=stab2 ! queue ! mix.sink_3 "
-        "udpsrc port=5104 caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ! rtpjitterbuffer latency=200 drop_on_latency=true ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
+        "udpsrc port=5104 caps=\"application/x-rtp,media=video,encoding-name=H264,"
+                    "payload=96,clock-rate=90000\" ! "
+            "rtpjitterbuffer latency=50 drop-on-latency=true ! rtph264depay ! h264parse ! avdec_h264 ! "
+            "videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! "
             "glshader name=lens3 ! gltransformation name=stab3 ! queue ! mix.sink_4";
 
     self->pipeline = gst_parse_launch(pipeline_str, &error);
