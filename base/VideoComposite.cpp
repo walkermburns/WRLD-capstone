@@ -3,6 +3,7 @@
 #include <gst/gl/gl.h>
 #include <math.h>
 #include <stdio.h>
+#include <vector>
 
 // Fragment shader string moved here for convenience
 static const gchar *distort_shader = 
@@ -118,32 +119,59 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     GMainLoop *loop;
     GError *error = NULL;
 
-    // build the pipeline string without embedded "//" comments
-    const gchar *pipeline_str =
-        "glvideomixer name=mix background=1 "
-        "sink_0::xpos=0 sink_0::ypos=0 sink_0::width=1920 sink_0::height=1080 "
-        "sink_1::xpos=1920 sink_1::ypos=0 sink_1::width=1920 sink_1::height=1080 "
-        "sink_2::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 "
-        "sink_3::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! "
-        "glcolorconvert ! "
-        "fpsdisplaysink video-sink=autovideosink text-overlay=true sync=true ";
-
-    self->pipeline = gst_parse_launch(pipeline_str, &error);
-    if (error != NULL) {
-        g_printerr("Could not build pipeline: %s\n", error->message);
-        g_clear_error(&error);
+    /* create pipeline and elements manually so the number/resolution/position
+       of mixer sinks can be changed at runtime. */
+    self->pipeline = gst_pipeline_new("video_pipeline");
+    if (!self->pipeline) {
+        g_printerr("run_pipeline: failed to create pipeline\n");
         return NULL;
     }
 
-    /* obtain the mixer so we can attach branches to it */
-    GstElement *mix = gst_bin_get_by_name(GST_BIN(self->pipeline), "mix");
-    if (!mix) {
-        g_printerr("run_pipeline: mixer element not found\n");
+    GstElement *mix = gst_element_factory_make("glvideomixer", "mix");
+    GstElement *convert = gst_element_factory_make("glcolorconvert", "conv");
+    GstElement *fps = gst_element_factory_make("fpsdisplaysink", "fps");
+    GstElement *videosink = gst_element_factory_make("autovideosink", "vsink");
+
+    if (!mix || !convert || !fps || !videosink) {
+        g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
     }
 
-    /* create four videotestsrc -> ... -> gltransformation branches in code */
-    for (int i = 0; i < 4; ++i) {
+    g_object_set(mix, "background", 1, NULL);
+    g_object_set(fps,
+                 "video-sink", videosink,
+                 "text-overlay", TRUE,
+                 "sync", TRUE,
+                 NULL);
+
+    /* add all elements to pipeline (videosink must be owned to avoid premature
+       free when fpsdisplaysink grabs it) */
+    gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, videosink, NULL);
+    if (!gst_element_link_many(mix, convert, fps, NULL)) {
+        g_printerr("run_pipeline: failed to link core elements\n");
+        return NULL;
+    }
+    /* no need to link fps->videosink; fpsdisplaysink handles its child sink */
+
+    /* we'll use mix pointer below when attaching branches */
+
+    /* dynamic configuration for mixer sinks; change values or number here */
+    struct SinkLayout { gint xpos, ypos, width, height; };
+    int num_sinks = 2;
+    std::vector<SinkLayout> layouts;
+    layouts.reserve(num_sinks);
+    for (int i = 0; i < num_sinks; ++i) {
+        /* default tiling, 2x2 grid at 1920x1080 each */
+        SinkLayout l;
+        l.xpos   = (i & 1) ? 1920 : 0;
+        l.ypos   = (i & 2) ? 1080 : 0;
+        l.width  = 1920;
+        l.height = 1080;
+        layouts.push_back(l);
+    }
+
+    /* create videotestsrc branches and hook them to mixer pads */
+    for (int i = 0; i < num_sinks; ++i) {
         GstElement *src   = gst_element_factory_make("videotestsrc", NULL);
         GstElement *rate  = gst_element_factory_make("videorate", NULL);
         GstElement *caps1 = gst_element_factory_make("capsfilter", NULL);
@@ -160,7 +188,6 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
             return NULL;
         }
 
-        /* configure elements exactly as in the original string */
         g_object_set(src, "pattern", (i < 2) ? 0 : 1, NULL);
         GstCaps *c1 = gst_caps_from_string(
             "video/x-raw,width=1920,height=1080,framerate=30/1");
@@ -174,21 +201,11 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         gst_bin_add_many(GST_BIN(self->pipeline),
                          src, caps1, rate, caps2, glup, shader, stab, NULL);
 
-        /* link step-by-step to diagnose failures if any */
-        if (!gst_element_link(src, caps1)) {
-            g_printerr("run_pipeline: src->caps1 link failed on branch %d\n", i);
-            return NULL;
-        }
-        if (!gst_element_link(caps1, rate)) {
-            g_printerr("run_pipeline: caps1->rate link failed on branch %d\n", i);
-            return NULL;
-        }
-        if (!gst_element_link(rate, caps2)) {
-            g_printerr("run_pipeline: rate->caps2 link failed on branch %d\n", i);
-            return NULL;
-        }
-        if (!gst_element_link_many(caps2, glup, shader, stab, NULL)) {
-            g_printerr("run_pipeline: caps2->glup/shader/stab link failed on branch %d\n", i);
+        if (!gst_element_link(src, caps1) ||
+            !gst_element_link(caps1, rate) ||
+            !gst_element_link(rate, caps2) ||
+            !gst_element_link_many(caps2, glup, shader, stab, NULL)) {
+            g_printerr("run_pipeline: branch %d link failed\n", i);
             return NULL;
         }
 
@@ -198,12 +215,14 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
             return NULL;
         }
 
-        /* set pad properties for positioning */
+        /* apply dynamic layout
+           (could be reassigned while running by reconfiguring pad properties) */
+        const SinkLayout &l = layouts[i];
         g_object_set(sinkpad,
-                     "xpos",   (i & 1) ? 1920 : 0,
-                     "ypos",   (i & 2) ? 1080 : 0,
-                     "width",  1920,
-                     "height", 1080,
+                     "xpos",   l.xpos,
+                     "ypos",   l.ypos,
+                     "width",  l.width,
+                     "height", l.height,
                      NULL);
 
         GstPad *srcpad = gst_element_get_static_pad(stab, "src");
@@ -215,8 +234,8 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         gst_object_unref(sinkpad);
     }
 
-    /* shaders and stabs can still be configured by name */
-    for (int i = 0; i < 4; i++) {
+    /* shaders and stabs can still be configured by name; use num_sinks */
+    for (int i = 0; i < num_sinks; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
         GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
@@ -227,10 +246,19 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         }
     }
 
-    self->stab[0] = gst_bin_get_by_name(GST_BIN(self->pipeline), "stab0");
-    self->stab[1] = gst_bin_get_by_name(GST_BIN(self->pipeline), "stab1");
-    self->stab[2] = gst_bin_get_by_name(GST_BIN(self->pipeline), "stab2");
-    self->stab[3] = gst_bin_get_by_name(GST_BIN(self->pipeline), "stab3");
+    /* update stab pointers; clear any remaining entries */
+    for (int i = 0; i < 4; ++i) {
+        if (i < num_sinks) {
+            char name[16];
+            snprintf(name, sizeof(name), "stab%d", i);
+            self->stab[i] = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
+        } else {
+            if (self->stab[i]) {
+                gst_object_unref(self->stab[i]);
+                self->stab[i] = nullptr;
+            }
+        }
+    }
 
     g_timeout_add(16, update_fake_imu_cb, self);
 
