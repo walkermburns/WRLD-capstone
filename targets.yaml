@@ -10,10 +10,12 @@ targets:
     path: "~/buoy/"
     video_port: 5101
     imu_port: 5001
-
   # - name: pi2
-  #   host: pi@192.168.1.102
-  #   path: /home/pi/buoy_app
+  #   host: walker@192.168.1.11
+  #   LAN_IP: 192.168.1.11
+  #   path: "~/buoy/"
+  #   video_port: 5102
+  #   imu_port: 5002
 
 # Camera parameters – resolution, framerate, bitrate, encoder type.
 # IMU settings – sample rate, filter coefficients, calibration file

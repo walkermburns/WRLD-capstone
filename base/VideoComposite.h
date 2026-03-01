@@ -8,8 +8,9 @@
 
 class VideoComposite {
 public:
-    // path to fragment shader read from disk
-    explicit VideoComposite(const std::string &shaderPath);
+    // path to fragment shader read from disk and list of UDP ports
+    explicit VideoComposite(const std::string &shaderPath,
+                            const std::vector<int> &ports);
     ~VideoComposite();
 
     // start the pipeline; on macOS this will be run from a secondary thread
@@ -17,11 +18,16 @@ public:
 
 private:
     GstElement *pipeline;
+    GstElement *mix_element;        // cached mixer for callbacks
     std::vector<GstElement*> stab;   // stabilization elements, one per source
 
     // configuration
     int num_src;                    // number of mixer sources/branches
+    std::vector<int> video_ports;   // UDP ports corresponding to each branch
     GstStructure *uniforms;         // shared k1/zoom structure for shaders
+
+    // runtime state tracking which branches have been linked
+    std::vector<bool> branch_active;
 
     // path/content of the distortion shader
     std::string shader_code;

@@ -12,11 +12,17 @@
 // static member definition
 VideoComposite *VideoComposite::s_instance = nullptr;
 
-VideoComposite::VideoComposite(const std::string &shaderPath)
-    : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f),
+VideoComposite::VideoComposite(const std::string &shaderPath,
+                                   const std::vector<int> &ports)
+    : pipeline(nullptr), mix_element(nullptr), live_k1(0.3f), live_zoom(1.1f),
       // default to four incoming UDP streams; we add a separate background
       // videotestsrc below rather than counting it here.
-      num_src(2), uniforms(nullptr), stab() {
+      num_src(0), uniforms(nullptr), stab(), branch_active() {
+    // copy port list and derive source count
+    video_ports = ports;
+    num_src = static_cast<int>(video_ports.size());
+    stab.assign(num_src, nullptr);
+    branch_active.assign(num_src, false);
     // load shader file
     std::ifstream in(shaderPath);
     if (!in) {
@@ -194,7 +200,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         layouts.push_back(l);
     }
     /* background resolution should cover all sources horizontally */
-    gint bg_width = self->num_src * 1920;
+    gint bg_width = (self->num_src > 0 ? self->num_src : 1) * 1920;
     gint bg_height = 1080; // match individual source height
 
     /* add pad probe to mixer src so we can update IMU/uniforms per frame */
@@ -273,7 +279,12 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         }
 
         /* configure udp source and RTP caps */
-        g_object_set(udpsrc, "port", 5101 + i, NULL);
+        int port = (i < (int)self->video_ports.size() ? self->video_ports[i] : 0);
+        if (port > 0) {
+            g_object_set(udpsrc, "port", port, NULL);
+        } else {
+            g_printerr("run_pipeline: invalid port for branch %d\n", i);
+        }
         GstCaps *rtpcaps = gst_caps_from_string(
             "application/x-rtp,media=video,encoding-name=H264,"
             "payload=96,clock-rate=90000");

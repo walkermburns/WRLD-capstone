@@ -43,7 +43,16 @@ int main()
 
     try {
         std::string shaderPath = "../distort.frag";
-        VideoComposite vc(shaderPath);
+        std::vector<int> videoPorts;
+        for (auto &n : cfg.targets) {
+            if (n.videoPort != 0) {
+                videoPorts.push_back(n.videoPort);
+            } else {
+                std::cerr << "[main] warning: node '" << n.name
+                          << "' has no videoPort, skipping" << "\n";
+            }
+        }
+        VideoComposite vc(shaderPath, videoPorts);
         vc.start();
     } catch (const std::exception &e) {
         std::cerr << "VideoComposite error: " << e.what() << "\n";
