@@ -4,31 +4,36 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
 
-// Fragment shader string moved here for convenience
-static const gchar *distort_shader = 
-    "#version 100\n"
-    "#ifdef GL_ES\n"
-    "precision mediump float;\n"
-    "#endif\n"
-    "varying vec2 v_texcoord;\n"
-    "uniform sampler2D tex;\n"
-    "uniform float k1;\n" // Custom uniform for distortion
-    "uniform float zoom;\n" // Custom uniform for zoom
-    "void main () {\n"
-    "  vec2 uv = (v_texcoord - 0.5) * 1.1;\n"
-    "  float r2 = dot(uv, uv);\n"
-    "  vec2 distorted_uv = uv * (1.0 + k1 * r2);\n"
-    "  gl_FragColor = texture2D(tex, distorted_uv + 0.5);\n"
-    "}\n";
 
 // static member definition
 VideoComposite *VideoComposite::s_instance = nullptr;
 
-VideoComposite::VideoComposite()
-    : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f) {
+VideoComposite::VideoComposite(const std::string &shaderPath)
+    : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f),
+      num_sinks(4), uniforms(nullptr) {
+    // load shader file
+    std::ifstream in(shaderPath);
+    if (!in) {
+        throw std::runtime_error("failed to open shader file " + shaderPath);
+    }
+    std::ostringstream buf;
+    buf << in.rdbuf();
+    shader_code = buf.str();
+    if (shader_code.empty()) {
+        throw std::runtime_error("shader file " + shaderPath + " is empty");
+    }
     for (int i = 0; i < 4; ++i)
         stab[i] = nullptr;
+
+    /* prepare the uniforms structure once and reuse it */
+    uniforms = gst_structure_new("uniforms",
+                                 "k1", G_TYPE_FLOAT, live_k1,
+                                 "zoom", G_TYPE_FLOAT, live_zoom,
+                                 NULL);
 }
 
 VideoComposite::~VideoComposite() {
@@ -38,6 +43,10 @@ VideoComposite::~VideoComposite() {
             if(stab[i]) gst_object_unref(stab[i]);
         }
         gst_object_unref(pipeline);
+    }
+    if (uniforms) {
+        gst_structure_free(uniforms);
+        uniforms = nullptr;
     }
 }
 
@@ -51,6 +60,24 @@ void VideoComposite::start() {
 #else
     run_pipeline(this);
 #endif
+}
+
+// setter helpers -----------------------------------------------------------
+
+void VideoComposite::setUniforms(float k1, float zoom) {
+    live_k1 = k1;
+    live_zoom = zoom;
+    if (uniforms) {
+        gst_structure_set(uniforms,
+                          "k1", G_TYPE_FLOAT, live_k1,
+                          "zoom", G_TYPE_FLOAT, live_zoom,
+                          NULL);
+    } else {
+        uniforms = gst_structure_new("uniforms",
+                                     "k1", G_TYPE_FLOAT, live_k1,
+                                     "zoom", G_TYPE_FLOAT, live_zoom,
+                                     NULL);
+    }
 }
 
 // static callbacks ----------------------------------------------------------
@@ -77,24 +104,20 @@ gboolean VideoComposite::update_fake_imu_cb(gpointer user_data) {
     float k1 = 0.3f + (sin(time_t) * 1.0f);
     float zoom = 1.1f;
 
-    GstStructure *vars = gst_structure_new("uniforms",
-        "k1", G_TYPE_FLOAT, k1,
-        "zoom", G_TYPE_FLOAT, zoom,
-        NULL);
+    /* update the shared structure instead of creating a new one */
+    self->setUniforms(k1, zoom);
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < self->num_sinks; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
         GstElement *shader = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
         if (shader) {
-            g_object_set(shader, "uniforms", vars, NULL);
+            g_object_set(shader, "uniforms", self->uniforms, NULL);
             gst_object_unref(shader);
         }
     }
 
-    gst_structure_free(vars);
-
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < self->num_sinks; i++) {
         if (self->stab[i]) {
             g_object_set(self->stab[i],
                 "translation-x", sway_x,
@@ -157,10 +180,9 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
 
     /* dynamic configuration for mixer sinks; change values or number here */
     struct SinkLayout { gint xpos, ypos, width, height; };
-    int num_sinks = 2;
     std::vector<SinkLayout> layouts;
-    layouts.reserve(num_sinks);
-    for (int i = 0; i < num_sinks; ++i) {
+    layouts.reserve(self->num_sinks);
+    for (int i = 0; i < self->num_sinks; ++i) {
         /* default tiling, 2x2 grid at 1920x1080 each */
         SinkLayout l;
         l.xpos   = (i & 1) ? 1920 : 0;
@@ -171,7 +193,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     }
 
     /* create videotestsrc branches and hook them to mixer pads */
-    for (int i = 0; i < num_sinks; ++i) {
+    for (int i = 0; i < self->num_sinks; ++i) {
         GstElement *src   = gst_element_factory_make("videotestsrc", NULL);
         GstElement *rate  = gst_element_factory_make("videorate", NULL);
         GstElement *caps1 = gst_element_factory_make("capsfilter", NULL);
@@ -235,12 +257,12 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     }
 
     /* shaders and stabs can still be configured by name; use num_sinks */
-    for (int i = 0; i < num_sinks; i++) {
+    for (int i = 0; i < self->num_sinks; i++) {
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
         GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
         if (shader_elem) {
-            g_object_set(shader_elem, "fragment", distort_shader, NULL);
+            g_object_set(shader_elem, "fragment", self->shader_code.c_str(), NULL);
             g_signal_connect(shader_elem, "update-shader", G_CALLBACK(on_draw_signal), self);
             gst_object_unref(shader_elem);
         }
@@ -248,7 +270,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
 
     /* update stab pointers; clear any remaining entries */
     for (int i = 0; i < 4; ++i) {
-        if (i < num_sinks) {
+        if (i < self->num_sinks) {
             char name[16];
             snprintf(name, sizeof(name), "stab%d", i);
             self->stab[i] = gst_bin_get_by_name(GST_BIN(self->pipeline), name);

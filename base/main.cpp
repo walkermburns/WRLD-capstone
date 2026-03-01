@@ -42,7 +42,8 @@ int main()
     }
 
     try {
-        VideoComposite vc;
+        std::string shaderPath = "../distort.frag";
+        VideoComposite vc(shaderPath);
         vc.start();
     } catch (const std::exception &e) {
         std::cerr << "VideoComposite error: " << e.what() << "\n";

@@ -3,10 +3,12 @@
 
 #include <gst/gst.h>
 #include <gst/gl/gl.h> // for GstGLShader
+#include <string>
 
 class VideoComposite {
 public:
-    VideoComposite();
+    // path to fragment shader read from disk
+    explicit VideoComposite(const std::string &shaderPath);
     ~VideoComposite();
 
     // start the pipeline; on macOS this will be run from a secondary thread
@@ -16,7 +18,14 @@ private:
     GstElement *pipeline;
     GstElement *stab[4];
 
-    // shader uniforms
+    // configuration
+    int num_sinks;                  // number of mixer sinks/branches
+    GstStructure *uniforms;         // shared k1/zoom structure for shaders
+
+    // path/content of the distortion shader
+    std::string shader_code;
+
+    // shader uniforms (current live values)
     float live_k1;
     float live_zoom;
 
@@ -24,6 +33,9 @@ private:
     static gboolean on_draw_signal(GstElement *glfilter, GstGLShader *shader,
                                    guint texture, guint width, guint height,
                                    gpointer user_data);
+
+    // helper setters
+    void setUniforms(float k1, float zoom);
 
     // entry-point used with gst_macos_main
     static void *run_pipeline(gpointer user_data);
