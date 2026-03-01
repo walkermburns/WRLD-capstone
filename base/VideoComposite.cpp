@@ -14,7 +14,7 @@ VideoComposite *VideoComposite::s_instance = nullptr;
 
 VideoComposite::VideoComposite(const std::string &shaderPath)
     : pipeline(nullptr), live_k1(0.3f), live_zoom(1.1f),
-      num_sinks(4), uniforms(nullptr) {
+      num_sinks(3), uniforms(nullptr) {
     // load shader file
     std::ifstream in(shaderPath);
     if (!in) {
@@ -179,10 +179,10 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     std::vector<SinkLayout> layouts;
     layouts.reserve(self->num_sinks);
     for (int i = 0; i < self->num_sinks; ++i) {
-        /* default tiling, 2x2 grid at 1920x1080 each */
+        /* arrange sinks end-to-end horizontally; each occupies a 1920x1080 block */
         SinkLayout l;
-        l.xpos   = (i & 1) ? 1920 : 0;
-        l.ypos   = (i & 2) ? 1080 : 0;
+        l.xpos   = i * 1920;
+        l.ypos   = 0;
         l.width  = 1920;
         l.height = 1080;
         layouts.push_back(l);
