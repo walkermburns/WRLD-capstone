@@ -1,53 +1,51 @@
 #pragma once
 #include <Eigen/Geometry>
+
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <vector>
-
-struct ImuSample {
-  std::chrono::steady_clock::time_point t;
-  Eigen::Quaternionf q; // (w,x,y,z)
-};
+#include <thread>
 
 class SerialImuReader {
 public:
-  SerialImuReader(std::string device, int baud);
+  struct Sample {
+    std::chrono::steady_clock::time_point t;
+    Eigen::Quaternionf q; // (w,x,y,z) in Eigen storage
+  };
+
+  SerialImuReader(const std::string& port, int baud);
   ~SerialImuReader();
+
+  void set_use_conjugate(bool v) { use_conjugate_ = v; }
 
   bool start();
   void stop();
 
-  // Query quaternion at time using SLERP; nullopt if out of range.
-  std::optional<Eigen::Quaternionf> quat_at(std::chrono::steady_clock::time_point t_query) const;
-
-  // Latest sample
-  std::optional<ImuSample> latest() const;
-
   size_t size() const;
 
-  void set_use_conjugate(bool v) { use_conjugate_.store(v); }
+  // Interpolated quaternion at time t (steady_clock domain)
+  std::optional<Eigen::Quaternionf> quat_at(const std::chrono::steady_clock::time_point& t_query) const;
+
+  // NEW: get the last two samples (for omega prediction)
+  bool latest_two(Sample& s1, Sample& s2) const;
 
 private:
   void thread_fn();
-  bool open_port();
-  void close_port();
-  bool configure_port();
-  bool parse_line(const std::string& line, Eigen::Quaternionf& q_out) const;
 
-  std::string device_;
-  int baud_;
-  int fd_ = -1;
+  bool parse_line_to_quat(const std::string& line, Eigen::Quaternionf& q_out) const;
+
+private:
+  std::string port_;
+  int baud_ = 115200;
+  bool use_conjugate_ = false;
+
+  std::atomic<bool> stop_{false};
+  std::thread th_;
 
   mutable std::mutex mtx_;
-  std::vector<ImuSample> buf_;
-  size_t max_samples_ = 600; // ~6s at 100 Hz
-
-  std::atomic<bool> running_{false};
-  std::atomic<bool> use_conjugate_{false};
-
-  struct ThreadState;
-  ThreadState* thread_state_ = nullptr;
+  std::deque<Sample> buf_;
+  size_t max_len_ = 600; // set in start()
 };

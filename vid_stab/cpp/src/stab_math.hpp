@@ -12,7 +12,7 @@ struct StabConfig {
 
   float gain = 1.0f;
   float smooth_alpha = 1.0f;
-  float max_tilt_rad = static_cast<float>(90.0 * M_PI / 180.0);
+  float max_tilt_rad = static_cast<float>(35.0 * M_PI / 180.0);
 };
 
 struct StabState {

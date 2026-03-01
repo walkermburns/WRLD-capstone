@@ -4,104 +4,56 @@
 #include <termios.h>
 #include <unistd.h>
 
-#include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <sstream>
-#include <thread>
+#include <vector>
 
-struct SerialImuReader::ThreadState {
-  std::thread th;
-};
-
-static speed_t baud_to_termios(int baud) {
-  switch (baud) {
-    case 9600: return B9600;
-    case 19200: return B19200;
-    case 38400: return B38400;
-    case 57600: return B57600;
-    case 115200: return B115200;
-    case 230400: return B230400;
-    default: return B115200;
-  }
-}
-
-SerialImuReader::SerialImuReader(std::string device, int baud)
-    : device_(std::move(device)), baud_(baud) {}
-
-SerialImuReader::~SerialImuReader() { stop(); }
-
-bool SerialImuReader::open_port() {
-  fd_ = ::open(device_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-  if (fd_ < 0) {
-    std::cerr << "open(" << device_ << ") failed: " << std::strerror(errno) << "\n";
-    return false;
-  }
-  return true;
-}
-
-void SerialImuReader::close_port() {
-  if (fd_ >= 0) {
-    ::close(fd_);
-    fd_ = -1;
-  }
-}
-
-bool SerialImuReader::configure_port() {
+static bool set_serial_attribs(int fd, int baud) {
   termios tty{};
-  if (tcgetattr(fd_, &tty) != 0) {
-    std::cerr << "tcgetattr failed: " << std::strerror(errno) << "\n";
-    return false;
-  }
+  if (tcgetattr(fd, &tty) != 0) return false;
 
   cfmakeraw(&tty);
 
-  speed_t spd = baud_to_termios(baud_);
-  cfsetispeed(&tty, spd);
-  cfsetospeed(&tty, spd);
+  speed_t speed = B115200;
+  if (baud == 57600) speed = B57600;
+  if (baud == 9600)  speed = B9600;
+
+  cfsetispeed(&tty, speed);
+  cfsetospeed(&tty, speed);
 
   tty.c_cflag |= (CLOCAL | CREAD);
-  tty.c_cflag &= ~PARENB;
-  tty.c_cflag &= ~CSTOPB;
-  tty.c_cflag &= ~CSIZE;
-  tty.c_cflag |= CS8;
   tty.c_cflag &= ~CRTSCTS;
 
   tty.c_cc[VMIN]  = 0;
-  tty.c_cc[VTIME] = 1; // 0.1s
+  tty.c_cc[VTIME] = 1; // 100 ms
 
-  if (tcsetattr(fd_, TCSANOW, &tty) != 0) {
-    std::cerr << "tcsetattr failed: " << std::strerror(errno) << "\n";
-    return false;
-  }
-
-  tcflush(fd_, TCIOFLUSH);
+  if (tcsetattr(fd, TCSANOW, &tty) != 0) return false;
   return true;
 }
 
-bool SerialImuReader::start() {
-  if (running_.load()) return true;
-  if (!open_port()) return false;
-  if (!configure_port()) {
-    close_port();
-    return false;
-  }
+SerialImuReader::SerialImuReader(const std::string& port, int baud)
+    : port_(port), baud_(baud) {}
 
-  running_.store(true);
-  thread_state_ = new ThreadState();
-  thread_state_->th = std::thread([this]() { thread_fn(); });
+SerialImuReader::~SerialImuReader() {
+  stop();
+}
+
+bool SerialImuReader::start() {
+  stop_ = false;
+
+  // Size your buffer for ~6 seconds at 100 Hz by default; you can adjust later.
+  // (You can also expose this as a setter.)
+  max_len_ = 600;
+
+  th_ = std::thread([this]() { thread_fn(); });
   return true;
 }
 
 void SerialImuReader::stop() {
-  if (!running_.load()) return;
-  running_.store(false);
-  if (thread_state_) {
-    if (thread_state_->th.joinable()) thread_state_->th.join();
-    delete thread_state_;
-    thread_state_ = nullptr;
-  }
-  close_port();
+  stop_ = true;
+  if (th_.joinable()) th_.join();
 }
 
 size_t SerialImuReader::size() const {
@@ -109,116 +61,121 @@ size_t SerialImuReader::size() const {
   return buf_.size();
 }
 
-std::optional<ImuSample> SerialImuReader::latest() const {
+bool SerialImuReader::latest_two(Sample& s1, Sample& s2) const {
   std::lock_guard<std::mutex> lk(mtx_);
-  if (buf_.empty()) return std::nullopt;
-  return buf_.back();
-}
-
-// CSV: roll,pitch,yaw,w,x,y,z
-bool SerialImuReader::parse_line(const std::string& line, Eigen::Quaternionf& q_out) const {
-  float vals[7];
-  int idx = 0;
-  std::string token;
-  std::stringstream ss(line);
-  while (std::getline(ss, token, ',')) {
-    if (idx >= 7) break;
-    try {
-      vals[idx] = std::stof(token);
-    } catch (...) {
-      return false;
-    }
-    idx++;
-  }
-  if (idx < 7) return false;
-
-  float w = vals[3], x = vals[4], y = vals[5], z = vals[6];
-
-  if (use_conjugate_.load()) {
-    x = -x; y = -y; z = -z;
-  }
-
-  q_out = Eigen::Quaternionf(w, x, y, z);
-  q_out.normalize();
+  if (buf_.size() < 2) return false;
+  s1 = buf_[buf_.size() - 2];
+  s2 = buf_[buf_.size() - 1];
   return true;
 }
 
-void SerialImuReader::thread_fn() {
-  std::string accum;
-  accum.reserve(4096);
+std::optional<Eigen::Quaternionf> SerialImuReader::quat_at(
+    const std::chrono::steady_clock::time_point& t_query) const {
 
-  while (running_.load()) {
-    char buf[512];
-    ssize_t n = ::read(fd_, buf, sizeof(buf));
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        continue;
-      }
-      std::cerr << "read error: " << std::strerror(errno) << "\n";
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
-    }
-    if (n == 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(2));
-      continue;
-    }
-
-    accum.append(buf, buf + n);
-
-    size_t pos = 0;
-    while (true) {
-      size_t nl = accum.find('\n', pos);
-      if (nl == std::string::npos) {
-        accum.erase(0, pos);
-        break;
-      }
-
-      std::string line = accum.substr(pos, nl - pos);
-      pos = nl + 1;
-      if (!line.empty() && line.back() == '\r') line.pop_back();
-
-      Eigen::Quaternionf q;
-      if (!parse_line(line, q)) continue;
-
-      ImuSample s;
-      s.t = std::chrono::steady_clock::now();
-      s.q = q;
-
-      {
-        std::lock_guard<std::mutex> lk(mtx_);
-        buf_.push_back(s);
-        if (buf_.size() > max_samples_) {
-          buf_.erase(buf_.begin(), buf_.begin() + (buf_.size() - max_samples_));
-        }
-      }
-    }
-  }
-}
-
-std::optional<Eigen::Quaternionf> SerialImuReader::quat_at(std::chrono::steady_clock::time_point t_query) const {
   std::lock_guard<std::mutex> lk(mtx_);
   if (buf_.size() < 2) return std::nullopt;
 
   if (t_query < buf_.front().t || t_query > buf_.back().t) return std::nullopt;
 
+  // Find first idx with t >= query
   size_t hi = 0;
   while (hi < buf_.size() && buf_[hi].t < t_query) hi++;
-  if (hi == 0) return buf_[0].q;
+
+  if (hi == 0) return buf_.front().q;
   if (hi >= buf_.size()) return buf_.back().q;
 
   const auto& a = buf_[hi - 1];
   const auto& b = buf_[hi];
 
-  const double dt = std::chrono::duration<double>(b.t - a.t).count();
-  if (dt <= 1e-9) return b.q;
+  const double ta = std::chrono::duration<double>(a.t.time_since_epoch()).count();
+  const double tb = std::chrono::duration<double>(b.t.time_since_epoch()).count();
+  const double tq = std::chrono::duration<double>(t_query.time_since_epoch()).count();
 
-  const double tq = std::chrono::duration<double>(t_query - a.t).count();
-  float u = static_cast<float>(tq / dt);
-  if (u < 0.f) u = 0.f;
-  if (u > 1.f) u = 1.f;
+  const double denom = std::max(tb - ta, 1e-9);
+  const double u = std::clamp((tq - ta) / denom, 0.0, 1.0);
 
-  Eigen::Quaternionf q = a.q.slerp(u, b.q);
+  Eigen::Quaternionf qa = a.q;
+  Eigen::Quaternionf qb = b.q;
+  qa.normalize();
+  qb.normalize();
+
+  Eigen::Quaternionf q = qa.slerp(float(u), qb);
   q.normalize();
   return q;
+}
+
+bool SerialImuReader::parse_line_to_quat(const std::string& line, Eigen::Quaternionf& q_out) const {
+  // Expect: roll_deg,pitch_deg,yaw_deg,w,x,y,z
+  // We use ONLY w,x,y,z (float). Arduino prints in that order.
+  std::vector<float> vals;
+  vals.reserve(7);
+
+  std::stringstream ss(line);
+  std::string item;
+  while (std::getline(ss, item, ',')) {
+    try {
+      vals.push_back(std::stof(item));
+    } catch (...) {
+      return false;
+    }
+  }
+  if (vals.size() < 7) return false;
+
+  float w = vals[3];
+  float x = vals[4];
+  float y = vals[5];
+  float z = vals[6];
+
+  if (use_conjugate_) {
+    x = -x; y = -y; z = -z;
+  }
+
+  Eigen::Quaternionf q(w, x, y, z);
+  q.normalize();
+  q_out = q;
+  return true;
+}
+
+void SerialImuReader::thread_fn() {
+  int fd = open(port_.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
+  if (fd < 0) {
+    std::cerr << "[imu] Failed to open " << port_ << "\n";
+    return;
+  }
+  if (!set_serial_attribs(fd, baud_)) {
+    std::cerr << "[imu] Failed to configure serial\n";
+    close(fd);
+    return;
+  }
+
+  std::string line;
+  line.reserve(256);
+
+  char buf[256];
+
+  while (!stop_) {
+    int n = read(fd, buf, sizeof(buf));
+    if (n <= 0) continue;
+
+    for (int i = 0; i < n; i++) {
+      char c = buf[i];
+      if (c == '\n') {
+        Eigen::Quaternionf q;
+        if (parse_line_to_quat(line, q)) {
+          Sample s;
+          s.t = std::chrono::steady_clock::now();
+          s.q = q;
+
+          std::lock_guard<std::mutex> lk(mtx_);
+          buf_.push_back(s);
+          if (buf_.size() > max_len_) buf_.pop_front();
+        }
+        line.clear();
+      } else if (c != '\r') {
+        line.push_back(c);
+      }
+    }
+  }
+
+  close(fd);
 }
