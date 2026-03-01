@@ -10,12 +10,12 @@ const uint32_t PERIOD_US = 5000;   // 1/200 s --> us
 static uint32_t next_us = 0;
 
 // 100 Hz print
-const uint32_t PRINT_MS = 20;      // 1/50 s --> ms
+const uint32_t PRINT_MS = 10;      // 1/100 s --> ms
 static uint32_t next_print_ms = 0;
 
 struct Quat {float w, x, y, z; };
 static Quat q = {1.0, 0, 0, 0};
-static const float Kp = 1.0f;
+static const float Kp = 5.0f;
 
 static const float gyro_x_bias = 0.013;
 static const float gyro_y_bias = -0.053;
@@ -67,21 +67,21 @@ void loop() {
     quatToEulerZYX(q, roll, pitch, yaw);
 
     // Serial.print("roll:");
-    Serial.print(rad2deg(roll), 2);
+    Serial.print(rad2deg(roll), 1);
     Serial.print(",");
     // Serial.print("pitch:");
-    Serial.print(rad2deg(pitch), 2);
+    Serial.print(rad2deg(pitch), 1);
     Serial.print(",");
     // Serial.print("yaw:");
-    Serial.print(rad2deg(yaw), 2); 
+    Serial.print(rad2deg(yaw), 1); 
     Serial.print(",");
-    Serial.print(q.w, 6);
+    Serial.print(q.w, 5);
     Serial.print(",");
-    Serial.print(q.x, 6);
+    Serial.print(q.x, 5);
     Serial.print(",");
-    Serial.print(q.y, 6);
+    Serial.print(q.y, 5);
     Serial.print(",");
-    Serial.println(q.z, 6);
+    Serial.println(q.z, 5);
 
 
   }

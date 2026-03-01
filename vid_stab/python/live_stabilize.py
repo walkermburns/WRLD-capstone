@@ -14,7 +14,7 @@ arduino_rate_hz = 50
 camera_fps = 30
 buffer_time_length_s = 4
 
-video_delay_s = 1
+video_delay_s = 0.05
 
 quat_buffer = deque(maxlen = buffer_time_length_s * arduino_rate_hz)
 ypr_buffer = deque(maxlen = buffer_time_length_s * arduino_rate_hz)

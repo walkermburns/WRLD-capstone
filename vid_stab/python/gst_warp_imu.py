@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
 """
-gst_warp_imu.py
+gst_warp_imu.py (Euler roll/pitch stabilization + latency compensation + filtered IMU prediction)
+FRAME-LOCKED uniforms (cv2-like)
 
-GStreamer (GL) homography warp driven by Arduino IMU quaternion stream.
+Key change:
+- Instead of applying uniforms on a timer (which can drift relative to buffers),
+  we schedule a main-thread uniform update immediately from the pad probe using GLib.idle_add.
+- To avoid flooding the main loop, we coalesce updates: if one is already scheduled, we just
+  replace the pending Hinv with the latest one.
 
-Includes:
-- Thread safety: never set glshader uniforms inside the pad-probe (streaming thread).
-  The probe only computes the latest Hinv; a GLib timer applies uniforms on the main thread.
-- Startup stability: until IMU is "ready" and we have a valid Hinv, we force identity.
-- Reliable debug prints: time-based throttle.
-- FLU conventions:
-    IMU is FLU: +x forward, +y left, +z up.
-    Map FLU -> OpenCV camera coords (x right, y down, z forward):
-        cv_x = -flu_y, cv_y = -flu_z, cv_z = flu_x
-- Stabilization convention (your working one):
-    R_rel = R_cur_flu * R_ref_flu.inv()
-
-NEW:
-- Smooth correction (EMA) on pitch/roll correction angles to reduce jitter.
-
-Run:
-  /usr/bin/python3 gst_warp_imu.py
+Folder assumption:
+  This file:   vid_stab/python/gst_warp_imu.py
+  Shader:      vid_stab/shaders/warp.frag
 """
+
 import sys
 import math
 import time
 import threading
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 import serial
@@ -46,7 +39,6 @@ BAUD = 115200
 ARDUINO_PRINT_HZ = 100
 BUFFER_TIME_S = 6.0
 
-VIDEO_DELAY_S = 1.0
 RES_W, RES_H = 640, 480
 HFOV_DEG = 50.0
 
@@ -55,11 +47,23 @@ USE_QUAT_CONJUGATE = False
 GAIN = 1.0
 MAX_TILT_RAD = math.radians(35.0)
 
-# Smoothing (EMA) on correction angles:
-# smaller => smoother but more lag; larger => snappier but more jitter
-SMOOTH_ALPHA = 0.95
+# 1.0 = no smoothing (most responsive). If standstill shimmer: 0.85
+ROT_SMOOTH_ALPHA = 1.0
 
-PRINT_EVERY_S = 0.5
+# Extra manual lead after latency compensation (usually 0.0)
+IMU_LEAD_S = 0.0
+
+CAPTURE_INITIAL_TILT_REF = True
+
+PREDICT_MAX_S = 0.12
+
+# With display_age ~68ms, start at 0.7 for less jitter; 1.0 is most aggressive
+COMPENSATE_FRAC = 1.0
+
+OMEGA_ALPHA = 0.25
+OMEGA_CLAMP = 25.0
+
+PRINT_EVERY_S = 1.0
 
 PIPELINE_DESC = f"""
 v4l2src device=/dev/video0 io-mode=2 !
@@ -68,7 +72,8 @@ queue max-size-buffers=1 leaky=downstream !
 videoconvert ! video/x-raw,format=RGBA !
 glupload !
 glshader name=stab qos=true !
-glimagesink sync=false
+queue name=qdisp max-size-buffers=1 leaky=downstream !
+glimagesink name=vsink sync=false
 """
 
 
@@ -81,14 +86,10 @@ stop_flag = threading.Event()
 
 
 def parse_imu_line(line: str):
-    """
-    Expected CSV from Arduino:
-      roll_deg,pitch_deg,yaw_deg,w,x,y,z
-    Returns quaternion in SciPy order [x,y,z,w].
-    """
     parts = line.split(",")
     if len(parts) < 7:
         raise ValueError("Not enough fields")
+
     w = float(parts[3])
     x = float(parts[4])
     y = float(parts[5])
@@ -124,21 +125,47 @@ def imu_thread_fn():
         pass
 
 
-def get_rot_at_perf_time(t_query: float) -> R:
+def get_rot_at_perf_time_local(t_query: float) -> R:
+    """Local SLERP between two nearest IMU samples."""
     with buf_lock:
         if len(quat_buffer) < 2:
             raise RuntimeError("Need more IMU samples")
-        times = np.array([t for (t, _) in quat_buffer], dtype=float)
-        quats = np.array([q for (_, q) in quat_buffer], dtype=float)
 
-    rots = R.from_quat(quats)
-    slerp = Slerp(times, rots)
-    return slerp([t_query])[0]
+        t0 = quat_buffer[0][0]
+        tN = quat_buffer[-1][0]
+        if t_query < t0 or t_query > tN:
+            raise RuntimeError("Query out of range")
+
+        hi = 0
+        while hi < len(quat_buffer) and quat_buffer[hi][0] < t_query:
+            hi += 1
+
+        if hi == 0:
+            return R.from_quat(quat_buffer[0][1])
+        if hi >= len(quat_buffer):
+            return R.from_quat(quat_buffer[-1][1])
+
+        ta, qa = quat_buffer[hi - 1]
+        tb, qb = quat_buffer[hi]
+        u = (t_query - ta) / (tb - ta + 1e-12)
+        u = float(np.clip(u, 0.0, 1.0))
+
+    Ra = R.from_quat(qa)
+    Rb = R.from_quat(qb)
+    s = Slerp([0.0, 1.0], R.from_quat([Ra.as_quat(), Rb.as_quat()]))
+    return s([u])[0]
 
 
-# -----------------------------
-# Time mapping: pipeline running-time -> perf_counter
-# -----------------------------
+def slerp_two(Ra: R, Rb: R, alpha: float) -> R:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return Ra
+    if alpha >= 1.0:
+        return Rb
+    s = Slerp([0.0, 1.0], R.from_quat([Ra.as_quat(), Rb.as_quat()]))
+    return s([alpha])[0]
+
+
 def gst_running_time_s(pipeline: Gst.Pipeline) -> float:
     clock = pipeline.get_clock()
     if clock is None:
@@ -150,9 +177,6 @@ def gst_running_time_s(pipeline: Gst.Pipeline) -> float:
     return float(now - base) / float(Gst.SECOND)
 
 
-# -----------------------------
-# Uniform helper (force float typing)
-# -----------------------------
 def make_uniforms_from_Hinv(Hinv: np.ndarray) -> Gst.Structure:
     uni = (
         f"uniforms, "
@@ -167,7 +191,7 @@ def make_uniforms_from_Hinv(Hinv: np.ndarray) -> Gst.Structure:
 def homography_is_safe(Hinv: np.ndarray, w: int, h: int) -> bool:
     xs = np.linspace(0.0, w - 1.0, 3)
     ys = np.linspace(0.0, h - 1.0, 3)
-    pts = np.array([[x, y, 1.0] for y in ys for x in xs], dtype=float).T  # 3x9
+    pts = np.array([[x, y, 1.0] for y in ys for x in xs], dtype=float).T
 
     q = Hinv @ pts
     z = q[2, :]
@@ -208,7 +232,7 @@ def main():
                   [0.0, 0.0, 1.0]], dtype=float)
     Kinv = np.linalg.inv(K)
 
-    # FLU -> OpenCV camera coords
+    # FLU -> OpenCV camera coords (x right, y down, z forward)
     R_flu_to_cv = np.array([[0, -1,  0],
                             [0,  0, -1],
                             [1,  0,  0]], dtype=float)
@@ -218,8 +242,16 @@ def main():
     if glshader is None:
         raise RuntimeError("Could not find glshader named 'stab'")
 
-    with open("../shaders/warp.frag", "r", encoding="utf-8") as f:
-        glshader.set_property("fragment", f.read())
+    vsink = pipe.get_by_name("vsink")
+    if vsink is None:
+        raise RuntimeError("Could not find glimagesink named 'vsink'")
+
+    # Load shader
+    shader_path = Path(__file__).resolve().parent.parent / "shaders" / "warp.frag"
+    frag_src = shader_path.read_text(encoding="utf-8")
+    if len(frag_src) < 50:
+        raise RuntimeError(f"Shader looks empty: {shader_path}")
+    glshader.set_property("fragment", frag_src)
     glshader.set_property("update-shader", True)
 
     loop = GLib.MainLoop()
@@ -227,45 +259,132 @@ def main():
     bus.add_signal_watch()
     bus.connect("message", on_bus_message, loop)
 
-    # Shared state for safe uniform updates
-    lock = threading.Lock()
-    latest_Hinv = np.eye(3, dtype=float)
-    have_update = True
-
-    # Time sync: perf ≈ running + offset
+    # perf ≈ running + offset
     tsync_initialized = False
     offset_perf_minus_running = 0.0
 
-    # Reference orientation (set once)
-    R_ref_flu = None
+    # Euler reference
+    have_ref = False
+    R_ref_flu = R.identity()
 
-    # Smoothing state (EMA) for correction angles
-    pitch_f = 0.0
-    roll_f = 0.0
+    # Correction smoothing
+    R_corr_filt = R.identity()
 
-    # Keep last good matrix
-    last_good_Hinv = np.eye(3, dtype=float)
-    bad_count = 0
+    # Display latency estimate (smoothed)
+    extra_lat_s = 0.0
+    extra_lat_alpha = 0.2
 
-    # Debug print throttle
-    last_print_wall = 0.0
+    # Filtered omega predictor state
+    omega_filt = np.zeros(3, dtype=float)
+    last_omega_time = 0.0
 
+    last_print = 0.0
+
+    def rot_at_time_with_filtered_prediction(t_query: float) -> R:
+        nonlocal omega_filt, last_omega_time
+
+        with buf_lock:
+            if len(quat_buffer) < 3:
+                raise RuntimeError("Need more IMU samples")
+            t_min = quat_buffer[0][0]
+            t_max = quat_buffer[-1][0]
+            t1, q1 = quat_buffer[-2]
+            t2, q2 = quat_buffer[-1]
+
+        if t_query < t_min:
+            raise RuntimeError("Query too old")
+
+        # update omega_filt once per new sample
+        if t2 != last_omega_time and t2 > t1:
+            R1 = R.from_quat(q1)
+            R2 = R.from_quat(q2)
+            dR = R2 * R1.inv()
+            omega_inst = dR.as_rotvec() / max(float(t2 - t1), 1e-6)
+            omega_inst = np.clip(omega_inst, -OMEGA_CLAMP, OMEGA_CLAMP)
+            omega_filt = (1.0 - OMEGA_ALPHA) * omega_filt + OMEGA_ALPHA * omega_inst
+            last_omega_time = t2
+
+        if t_query <= t_max:
+            return get_rot_at_perf_time_local(t_query)
+
+        dt_pred = float(np.clip(t_query - t_max, 0.0, PREDICT_MAX_S))
+        R2 = R.from_quat(q2)
+        return R2 * R.from_rotvec(omega_filt * dt_pred)
+
+    # ---------- Frame-locked uniform application (coalesced) ----------
+    apply_lock = threading.Lock()
+    pending_Hinv = np.eye(3, dtype=float)
+    apply_scheduled = False
+
+    def _apply_pending_uniforms():
+        """
+        Runs on GLib main thread.
+        Applies the *latest* pending Hinv (coalesced).
+        """
+        nonlocal apply_scheduled, pending_Hinv
+        with apply_lock:
+            H = pending_Hinv.copy()
+            apply_scheduled = False
+
+        # Set uniforms on main thread (safe)
+        glshader.set_property("uniforms", make_uniforms_from_Hinv(H))
+        return False  # run once
+
+    def schedule_apply(Hinv: np.ndarray):
+        """
+        Called from streaming thread (pad probe).
+        Coalesce: only one idle callback at a time; overwrite pending matrix.
+        """
+        nonlocal apply_scheduled, pending_Hinv
+        with apply_lock:
+            pending_Hinv = Hinv
+            if apply_scheduled:
+                return
+            apply_scheduled = True
+
+        GLib.idle_add(_apply_pending_uniforms, priority=GLib.PRIORITY_HIGH)
+
+    # Late probe: estimate display-side age
+    vsink_pad = vsink.get_static_pad("sink")
+    if vsink_pad is None:
+        raise RuntimeError("Could not get vsink sink pad")
+
+    def late_probe_cb(pad, info):
+        nonlocal extra_lat_s
+        buf = info.get_buffer()
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+
+        rt_frame_late = float(buf.pts) / float(Gst.SECOND)
+        rt_now_late = gst_running_time_s(pipe)
+        if rt_now_late <= 0.0:
+            return Gst.PadProbeReturn.OK
+
+        age_display = max(0.0, rt_now_late - rt_frame_late)
+        age_display = float(np.clip(age_display, 0.0, 0.25))
+        extra_lat_s = (1.0 - extra_lat_alpha) * extra_lat_s + extra_lat_alpha * age_display
+        return Gst.PadProbeReturn.OK
+
+    vsink_pad.add_probe(Gst.PadProbeType.BUFFER, late_probe_cb)
+
+    # Early probe: compute Hinv
     sinkpad = glshader.get_static_pad("sink")
     if sinkpad is None:
         raise RuntimeError("Could not get glshader sink pad")
 
+    last_good_Hinv = np.eye(3, dtype=float)
+
     def probe_cb(pad, info):
         nonlocal tsync_initialized, offset_perf_minus_running
-        nonlocal R_ref_flu, latest_Hinv, have_update
-        nonlocal last_good_Hinv, bad_count
-        nonlocal last_print_wall
-        nonlocal pitch_f, roll_f
+        nonlocal have_ref, R_ref_flu
+        nonlocal R_corr_filt
+        nonlocal last_print
+        nonlocal last_good_Hinv
 
         buf = info.get_buffer()
         if buf is None:
             return Gst.PadProbeReturn.OK
 
-        # Frame time in pipeline running-time
         if buf.pts != Gst.CLOCK_TIME_NONE:
             rt_frame = float(buf.pts) / float(Gst.SECOND)
         else:
@@ -273,117 +392,105 @@ def main():
             if rt_frame <= 0.0:
                 return Gst.PadProbeReturn.OK
 
-        # Initialize mapping once
         if not tsync_initialized:
-            rt_now = gst_running_time_s(pipe)
-            if rt_now <= 0.0:
+            rt_now0 = gst_running_time_s(pipe)
+            if rt_now0 <= 0.0:
                 return Gst.PadProbeReturn.OK
-            offset_perf_minus_running = time.perf_counter() - rt_now
+            offset_perf_minus_running = time.perf_counter() - rt_now0
             tsync_initialized = True
 
-        t_frame_perf = rt_frame + offset_perf_minus_running
-        t_target_perf = t_frame_perf - VIDEO_DELAY_S
+        rt_now = gst_running_time_s(pipe)
+        if rt_now <= 0.0:
+            return Gst.PadProbeReturn.OK
 
-        # Ensure IMU buffer is ready + query times are in-range
+        lat_probe = float(np.clip(max(0.0, rt_now - rt_frame), 0.0, 0.25))
+
+        lead_total = COMPENSATE_FRAC * extra_lat_s + IMU_LEAD_S
+        t_frame_perf = rt_frame + offset_perf_minus_running + lead_total
+
         with buf_lock:
             if len(quat_buffer) < 20:
-                with lock:
-                    latest_Hinv = np.eye(3, dtype=float)
-                    have_update = True
+                # identity warp while IMU warms up
+                schedule_apply(np.eye(3, dtype=float))
                 return Gst.PadProbeReturn.OK
             t_min = quat_buffer[0][0]
-            t_max = quat_buffer[-1][0]
 
-        if not (t_min <= t_frame_perf <= t_max and t_min <= t_target_perf <= t_max):
-            with lock:
-                latest_Hinv = last_good_Hinv
-                have_update = True
+        if t_frame_perf < t_min:
+            # too old, hold last
+            schedule_apply(last_good_Hinv)
             return Gst.PadProbeReturn.OK
 
         try:
-            R_cur_flu = get_rot_at_perf_time(t_frame_perf)
-
-            # Set reference ONCE
-            if R_ref_flu is None:
-                R_ref_flu = get_rot_at_perf_time(t_target_perf)
-
+            R_cur_flu = rot_at_time_with_filtered_prediction(t_frame_perf)
         except Exception:
+            schedule_apply(last_good_Hinv)
             return Gst.PadProbeReturn.OK
 
-        # Debug: absolute angles
-        now = time.time()
-        if now - last_print_wall >= PRINT_EVERY_S:
+        now_wall = time.time()
+        if now_wall - last_print >= PRINT_EVERY_S:
             ypr_cur = R_cur_flu.as_euler("zyx", degrees=True)
             print(
-                f"[CUR] yaw={ypr_cur[0]: .2f} pitch={ypr_cur[1]: .2f} roll={ypr_cur[2]: .2f} deg",
+                f"[CUR] yaw={ypr_cur[0]: .2f} pitch={ypr_cur[1]: .2f} roll={ypr_cur[2]: .2f} deg\n"
+                f"[lat] probe_age={lat_probe*1000:.1f} ms  display_age={extra_lat_s*1000:.1f} ms  "
+                f"lead_used={lead_total*1000:.1f} ms",
                 flush=True
             )
-            last_print_wall = now
+            last_print = now_wall
 
-        # Your working relative rotation convention
+        if CAPTURE_INITIAL_TILT_REF and (not have_ref):
+            R_ref_flu = R_cur_flu
+            have_ref = True
+            print("[ref] captured initial reference orientation (preserve starting tilt)", flush=True)
+
+        if (not CAPTURE_INITIAL_TILT_REF) and (not have_ref):
+            R_ref_flu = R.identity()
+            have_ref = True
+
+        if not have_ref:
+            schedule_apply(np.eye(3, dtype=float))
+            return Gst.PadProbeReturn.OK
+
+        # Relative rotation reference -> current
         R_rel = R_cur_flu * R_ref_flu.inv()
-
-        # Roll/pitch-only correction (zero yaw)
         yaw, pitch, roll = R_rel.as_euler("zyx", degrees=False)
 
-        # Smooth the correction angles (EMA)
-        pitch_f = (1.0 - SMOOTH_ALPHA) * pitch_f + SMOOTH_ALPHA * pitch
-        roll_f  = (1.0 - SMOOTH_ALPHA) * roll_f  + SMOOTH_ALPHA * roll
+        pitch_c = float(np.clip(-GAIN * pitch, -MAX_TILT_RAD, MAX_TILT_RAD))
+        roll_c = float(np.clip(-GAIN * roll, -MAX_TILT_RAD, MAX_TILT_RAD))
+        R_corr = R.from_euler("zyx", [0.0, pitch_c, roll_c], degrees=False)
 
-        pitch_c = float(np.clip(GAIN * pitch_f, -MAX_TILT_RAD, MAX_TILT_RAD))
-        roll_c  = float(np.clip(GAIN * roll_f,  -MAX_TILT_RAD, MAX_TILT_RAD))
+        if ROT_SMOOTH_ALPHA < 1.0:
+            R_corr_filt = slerp_two(R_corr_filt, R_corr, ROT_SMOOTH_ALPHA)
+            R_use = R_corr_filt
+        else:
+            R_use = R_corr
 
-        R_stab_flu = R.from_euler("zyx", [0.0, pitch_c, roll_c], degrees=False)
-
-        # Homography from rotation
-        R_stab_cv = R_flu_to_cv @ R_stab_flu.as_matrix() @ R_flu_to_cv.T
+        # Build homography. Your warp.frag empirically wants inv() here.
+        R_stab_cv = R_flu_to_cv @ R_use.inv().as_matrix() @ R_flu_to_cv.T
         H = K @ R_stab_cv @ Kinv
 
-        # Inverse mapping (dest->src)
         try:
             Hinv = np.linalg.inv(H)
         except np.linalg.LinAlgError:
-            bad_count += 1
             Hinv = last_good_Hinv
 
-        # Reject invalid / unsafe matrices
-        if not np.isfinite(Hinv).all():
-            bad_count += 1
-            Hinv = last_good_Hinv
-        elif not homography_is_safe(Hinv, RES_W, RES_H):
-            bad_count += 1
+        if (not np.isfinite(Hinv).all()) or (not homography_is_safe(Hinv, RES_W, RES_H)):
             Hinv = last_good_Hinv
         else:
             last_good_Hinv = Hinv
 
-        if bad_count > 0 and bad_count % 120 == 0:
-            print(f"[warn] rejected frames so far: {bad_count}", flush=True)
-
-        with lock:
-            latest_Hinv = Hinv
-            have_update = True
+        # Frame-locked apply (coalesced, main thread)
+        schedule_apply(Hinv)
 
         return Gst.PadProbeReturn.OK
 
     sinkpad.add_probe(Gst.PadProbeType.BUFFER, probe_cb)
 
-    # Main-thread timer: apply uniforms safely
-    def apply_uniforms():
-        nonlocal have_update
-        with lock:
-            if not have_update:
-                return True
-            H = latest_Hinv.copy()
-            have_update = False
-
-        glshader.set_property("uniforms", make_uniforms_from_Hinv(H))
-        return True
-
-    GLib.timeout_add(33, apply_uniforms)
-
+    # Start pipeline
     pipe.set_state(Gst.State.PLAYING)
     try:
         loop.run()
+    except KeyboardInterrupt:
+        pass
     finally:
         stop_flag.set()
         pipe.set_state(Gst.State.NULL)
