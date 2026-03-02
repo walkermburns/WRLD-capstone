@@ -10,7 +10,7 @@ find_package(Protobuf REQUIRED)
 find_package(absl REQUIRED)
 
 # Generate the files from your proto definition
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ../buoy.proto)
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ../../buoy.proto)
 
 # Create a mini-library for the proto code
 add_library(proto_lib STATIC ${PROTO_SRCS} ${PROTO_HDRS})
@@ -49,6 +49,18 @@ target_link_libraries(gl_composite_test
         PkgConfig::GST # Pulls in GStreamer code + include paths
         m              # Math library
 )
+
+# copy any .frag files (shaders) into the build tree alongside the binary
+file(GLOB FRAG_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.frag")
+foreach(_frag ${FRAG_FILES})
+    get_filename_component(_frag_name ${_frag} NAME)
+    add_custom_command(TARGET gl_composite_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${_frag}
+                $<TARGET_FILE_DIR:gl_composite_test>/${_frag_name}
+        COMMENT "Copy shader ${_frag_name} to output directory")
+endforeach()
+
 # base station executable listens for protobuf messages from each buoy
 add_executable(base_station main.cpp Config.cpp BuoyNode.cpp VideoComposite.cpp)
 

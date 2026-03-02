@@ -42,7 +42,7 @@ int main()
     }
 
     try {
-        std::string shaderPath = "../distort.frag";
+        std::string shaderPath = "distort.frag";
         std::vector<int> videoPorts;
         for (auto &n : cfg.targets) {
             if (n.videoPort != 0) {
