@@ -93,10 +93,10 @@ int main()
 {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-    std::thread recvThread(receiveLoop, 5000);
+    std::thread recvThread(receiveLoop, 5001);
     std::thread printerThread(printLoop);
 
-    std::cout << "IMU Receiver listening on port 5000...\n";
+    std::cout << "IMU Receiver listening on port 5001...\n";
 
     std::this_thread::sleep_for(std::chrono::minutes(10));
     running = false;

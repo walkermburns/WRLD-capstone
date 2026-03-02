@@ -32,6 +32,13 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
     gstreamer-video-1.0
     gstreamer-gl-1.0
 )
+pkg_check_modules(GST_RTP REQUIRED IMPORTED_TARGET
+    gstreamer-rtp-1.0
+)
+
+# yaml is used by the base station for configuration parsing
+# use the modern imported target interface to avoid deprecation warnings
+find_package(yaml-cpp REQUIRED)
 
 # --- FINAL EXECUTABLE ---
 add_executable(gl_composite_test prototest.cpp)
@@ -41,4 +48,14 @@ target_link_libraries(gl_composite_test
         proto_lib      # Pulls in Protobuf code + include paths
         PkgConfig::GST # Pulls in GStreamer code + include paths
         m              # Math library
+)
+# base station executable listens for protobuf messages from each buoy
+add_executable(base_station main.cpp Config.cpp BuoyNode.cpp VideoComposite.cpp)
+
+# VideoComposite (and main.cpp) requires GStreamer headers and libs
+target_link_libraries(base_station PRIVATE 
+    proto_lib
+    yaml-cpp::yaml-cpp
+    PkgConfig::GST
+    PkgConfig::GST_RTP
 )
