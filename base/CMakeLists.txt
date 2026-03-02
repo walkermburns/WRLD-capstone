@@ -32,6 +32,9 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
     gstreamer-video-1.0
     gstreamer-gl-1.0
 )
+pkg_check_modules(GST_RTP REQUIRED IMPORTED_TARGET
+    gstreamer-rtp-1.0
+)
 
 # yaml is used by the base station for configuration parsing
 # use the modern imported target interface to avoid deprecation warnings
@@ -54,4 +57,5 @@ target_link_libraries(base_station PRIVATE
     proto_lib
     yaml-cpp::yaml-cpp
     PkgConfig::GST
+    PkgConfig::GST_RTP
 )

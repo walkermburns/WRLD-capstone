@@ -1,6 +1,7 @@
 #include "VideoComposite.h"
 #include <gst/video/video.h>
 #include <gst/gl/gl.h>
+#include <gst/rtp/rtp.h>    // parse RTP headers and extensions
 #include <math.h>
 #include <stdio.h>
 #include <vector>
@@ -11,6 +12,40 @@
 
 // static member definition
 VideoComposite *VideoComposite::s_instance = nullptr;
+
+// probe that reads one‑byte RFC5285 extension id=1 carrying 64-bit microsecond
+// timestamp and prints it alongside sequence number.
+static GstPadProbeReturn rtp_timestamp_probe(GstPad *pad, GstPadProbeInfo *info,
+                                             gpointer /*user_data*/)
+{
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf)
+        return GST_PAD_PROBE_OK;
+
+    GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
+    if (gst_rtp_buffer_map(buf, GST_MAP_READ, &rtp)) {
+        guint16 seq = gst_rtp_buffer_get_seq(&rtp);
+        guint32 ts = gst_rtp_buffer_get_timestamp(&rtp);
+        gboolean ext = gst_rtp_buffer_get_extension(&rtp);
+        if (ext) {
+            guint16 profile;
+            gpointer data;
+            guint wordlen;
+            if (gst_rtp_buffer_get_extension_data(&rtp, &profile, &data, &wordlen)) {
+                if (profile == 0xBEDE && wordlen * 4 >= 12) {
+                    guint8 *extdata = static_cast<guint8 *>(data);
+                    guint64 ts_us;
+                    memcpy(&ts_us, extdata + 1, sizeof(ts_us));
+                    ts_us = GUINT64_FROM_BE(ts_us);
+                    g_print("[rtp] seq=%u ts=%u ts_us=%" G_GUINT64_FORMAT "\n",
+                            seq, ts, ts_us);
+                }
+            }
+        }
+        gst_rtp_buffer_unmap(&rtp);
+    }
+    return GST_PAD_PROBE_OK;
+}
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                    const std::vector<int> &ports)
@@ -259,6 +294,14 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         GstElement *udpsrc    = gst_element_factory_make("udpsrc", NULL);
         GstElement *jitter    = gst_element_factory_make("rtpjitterbuffer", NULL);
         GstElement *depay     = gst_element_factory_make("rtph264depay", NULL);
+        if (jitter) {
+            GstPad *j_src = gst_element_get_static_pad(jitter, "src");
+            if (j_src) {
+                gst_pad_add_probe(j_src, GST_PAD_PROBE_TYPE_BUFFER,
+                                  rtp_timestamp_probe, NULL, NULL);
+                gst_object_unref(j_src);
+            }
+        }
         GstElement *parse     = gst_element_factory_make("h264parse", NULL);
         GstElement *dec       = gst_element_factory_make("avdec_h264", NULL);
         GstElement *conv      = gst_element_factory_make("videoconvert", NULL);
