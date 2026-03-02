@@ -34,7 +34,7 @@ pkg_check_modules(GST REQUIRED IMPORTED_TARGET
 )
 
 # --- FINAL EXECUTABLE ---
-add_executable(gl_composite_test main.cpp)
+add_executable(gl_composite_test prototest.cpp)
 
 target_link_libraries(gl_composite_test
     PRIVATE

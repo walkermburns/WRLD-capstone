@@ -1,27 +1,39 @@
 #pragma once
-#include <stdint.h>
 
-typedef struct {
-    float x;
-    float y;
-    float z;
-} mora_float_vec_t;
+#include <cstdint>
 
-typedef struct {
-    uint16_t x;
-    uint16_t y;
-    uint16_t z;
-} mora_int_vec_t;
+// small helper types make the intent clear and let you add utility methods
+struct Vec3 {
+    float x, y, z;
+};
 
-// typedef struct {
-//     mora_int_vec_t acc_raw;
-//     mora_float_vec_t acc;
-//     mora_int_vec_t gyro_raw;
-//     mora_float_vec_t gyro;
-// } IMUdata_t;
+struct Quaternion {
+    float w, x, y, z;
+};
 
-typedef struct {
-    float ax, ay, az;   // m/s^2
-    float gx, gy, gz;   // deg/s
-    float qw, qx, qy, qz; // unit quaternion
-} IMUData_t;
+// primary data container used by all IMU drivers.  remains POD so it can be
+// copied into queues and sent over the network without any allocator or
+// ownership issues.
+struct IMUData {
+    Vec3 accel;        // m/s²
+    Vec3 gyro;         // °/s
+    Quaternion quat;   // unit
+};
+
+
+// abstract base class defining the public interface for all IMU drivers.
+// drivers such as BNO055 inherit from this so that higher‑level code can
+// treat sensors polymorphically (for instance, swapping in a mocked
+// implementation for testing).
+
+class IMUInterface {
+public:
+    virtual ~IMUInterface() = default;
+
+    // initialise the sensor; returns true on success.
+    virtual bool init() = 0;
+
+    // read the latest sample from the device.  The reference returned
+    // remains valid until the next call to readSensor().
+    virtual const IMUData &readSensor() = 0;
+};

@@ -1,27 +1,4 @@
 
-// #include <iostream>
-// #include <string>
-// #include <random>
-// #include <chrono>
-// #include <sys/socket.h>
-// #include <netinet/in.h>
-// #include <arpa/inet.h>
-// #include <unistd.h>
-
-// int main() {
-    
-//     IMU imu;
-    
-//     try {
-//         while (true) {
-//             imu.read_sensor();
-//             usleep(200000);
-//         }
-//     } catch (const std::exception& e) {
-//         std::cerr << "Error: " << e.what() << std::endl;
-//     }
-// }
-
 #include "BNO055.h"
 #include <thread>
 #include <atomic>
@@ -31,85 +8,68 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
 #include "buoy.pb.h"
+#include "IMUProtoSender.h"
+#include "VideoStreamer.h"
+#include "Config.h"
+#include <condition_variable>
+#include <pthread.h>
 
 static std::atomic<bool> running{true};
-static std::queue<IMUData_t> imuQueue;
+static std::queue<IMUData> imuQueue;
 static std::mutex queueMutex;
+static std::condition_variable dataCv;
 
 // =============================
 // Sensor Thread (100 Hz)
 // =============================
-void sensorLoop(IMU imu)
+void sensorLoop(IMUInterface &imu)
 {
+    pthread_setname_np(pthread_self(), "sensor");
+    std::cout << "[sensor] started\n";
     while (running)
     {
-        IMUData_t data = imu.read_sensor();
+        IMUData data = imu.readSensor();
 
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             imuQueue.push(data);
         }
+        dataCv.notify_one();
 
         usleep(10000); // 100 Hz
     }
+    std::cout << "[sensor] exiting\n";
 }
 
 // =============================
 // Sender Thread (UDP)
 // =============================
-void senderLoop(const char* ip, int port)
+void senderLoop(IMUProtoSender &sender)
 {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &addr.sin_addr);
-
+    pthread_setname_np(pthread_self(), "sender");
+    std::cout << "[sender] started\n";
     while (running)
     {
-        IMUData_t data;
-
+        IMUData data;
         {
-            std::lock_guard<std::mutex> lock(queueMutex);
-            if (imuQueue.empty())
-                continue;
+            std::unique_lock<std::mutex> lock(queueMutex);
+            dataCv.wait(lock, []{
+                return !imuQueue.empty() || !running;
+            });
+
+            if (!running && imuQueue.empty())
+                break;
 
             data = imuQueue.front();
             imuQueue.pop();
         }
 
-        buoy_proto::IMU_proto msg;
-
-        msg.set_acc_x(data.ax);
-        msg.set_acc_y(data.ay);
-        msg.set_acc_z(data.az);
-        msg.set_gyr_x(data.gx);
-        msg.set_gyr_y(data.gy);
-        msg.set_gyr_z(data.gz);
-        msg.set_quat_w(data.qw);
-        msg.set_quat_x(data.qx);
-        msg.set_quat_y(data.qy);
-        msg.set_quat_z(data.qz);
-
-        uint64_t ts = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
-
-        msg.set_timestamp(ts);
-
-        std::string buffer;
-        msg.SerializeToString(&buffer);
-
-        sendto(sock,
-               buffer.data(),
-               buffer.size(),
-               0,
-               (sockaddr*)&addr,
-               sizeof(addr));
+        if (!sender.sendIMU(data))
+            std::cerr << "[sender] failed to send IMU\n";
     }
-
-    close(sock);
+    std::cout << "[sender] exiting\n";
 }
 
 // =============================
@@ -119,20 +79,57 @@ int main()
 {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-    IMU imu;
+    // read configuration describing this target
+    TargetConfig cfg;
+    if (!loadTargetConfig("../src/configs/targets.yaml", cfg)) {
+        std::cerr << "Failed to load target configuration\n";
+        return -1;
+    }
+
+    std::cout << "[main] loaded config: baseIp=" << cfg.baseIp
+              << " buoyIp=" << cfg.buoyIp
+              << " imuPort=" << cfg.imuPort
+              << " videoPort=" << cfg.videoPort << "\n";
+
+    // create concrete sensor implementation; defaults match original
+    BNO055Driver imu;
 
     if (!imu.init()) {
         return -1;
     }
 
-    std::thread sensorThread(sensorLoop, imu);
-    std::thread networkThread(senderLoop, "192.168.1.9", 5000);
+    // pass by reference to avoid slicing
+    std::cout << "[main] starting sensor thread\n";
+    std::thread sensorThread(sensorLoop, std::ref(imu));
 
-    std::this_thread::sleep_for(std::chrono::seconds(60));
-    running = false;
+    // create sender instance based on config and give it to the thread
+    // send IMU/video to base station
+    IMUProtoSender sender(cfg.baseIp.c_str(), cfg.imuPort);
+    std::cout << "[main] starting sender thread\n";
+    std::thread networkThread(senderLoop, std::ref(sender));
+
+    // simultaneously start the video streamer; uses an independent port
+    VideoStreamer video(cfg.baseIp, cfg.videoPort);
+    std::cout << "[main] video streamer constructed\n";
+    video.start();
+    std::cout << "[main] video thread started\n";
+
+    // instead of sleeping a fixed time, stay alive until a signal
+    // requests shutdown.  signal handler simply clears the atomic.
+    std::signal(SIGINT, [](int){ running = false; });
+    std::signal(SIGTERM, [](int){ running = false; });
+
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // shutdown video immediately; other threads may still be finishing
+    video.stop();
+    std::cout << "[main] video stopped\n";
 
     sensorThread.join();
     networkThread.join();
+    std::cout << "[main] imu & sender threads joined\n";
 
     google::protobuf::ShutdownProtobufLibrary();
 }
