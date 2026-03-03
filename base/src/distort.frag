@@ -12,5 +12,6 @@ void main () {
     vec2 uv = (v_texcoord - 0.5) * 1.1;
     float r2 = dot(uv, uv);
     vec2 distorted_uv = uv * (1.0 + k1 * r2);
-    gl_FragColor = texture2D(tex, distorted_uv + 0.5);
+    // gl_FragColor = texture2D(tex, distorted_uv + 0.5);
+    gl_FragColor = texture2D(tex, v_texcoord);
 }

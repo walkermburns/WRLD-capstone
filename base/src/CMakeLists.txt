@@ -51,15 +51,15 @@ target_link_libraries(gl_composite_test
 )
 
 # copy any .frag files (shaders) into the build tree alongside the binary
-file(GLOB FRAG_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.frag")
-foreach(_frag ${FRAG_FILES})
-    get_filename_component(_frag_name ${_frag} NAME)
-    add_custom_command(TARGET gl_composite_test POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${_frag}
-                $<TARGET_FILE_DIR:gl_composite_test>/${_frag_name}
-        COMMENT "Copy shader ${_frag_name} to output directory")
-endforeach()
+# file(GLOB FRAG_FILES "${CMAKE_CURRENT_SOURCE_DIR}/*.frag")
+# foreach(_frag ${FRAG_FILES})
+#     get_filename_component(_frag_name ${_frag} NAME)
+#     add_custom_command(TARGET gl_composite_test POST_BUILD
+#         COMMAND ${CMAKE_COMMAND} -E copy_if_different
+#                 ${_frag}
+#                 $<TARGET_FILE_DIR:gl_composite_test>/${_frag_name}
+#         COMMENT "Copy shader ${_frag_name} to output directory")
+# endforeach()
 
 # base station executable listens for protobuf messages from each buoy
 add_executable(base_station main.cpp Config.cpp BuoyNode.cpp VideoComposite.cpp)

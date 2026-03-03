@@ -10,6 +10,7 @@
 #include "BuoyNode.h"
 #include "buoy.pb.h"
 #include "VideoComposite.h"
+#include <filesystem>   // existence check for shader path
 
 static std::atomic<bool> running{true};
 
@@ -42,7 +43,14 @@ int main()
     }
 
     try {
-        std::string shaderPath = "distort.frag";
+        std::string shaderPath = "../src/warp.frag";
+        // quickly verify the file exists using C++17 filesystem so we can
+        // diagnose bad relative paths before VideoComposite is constructed.
+        if (!std::filesystem::exists(shaderPath)) {
+            std::cerr << "[main] shader path does not exist: '" << shaderPath
+                      << "' (cwd=" << std::filesystem::current_path() << ")\n";
+        }
+
         std::vector<int> videoPorts;
         for (auto &n : cfg.targets) {
             if (n.videoPort != 0) {

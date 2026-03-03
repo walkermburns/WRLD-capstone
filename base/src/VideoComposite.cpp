@@ -1,4 +1,5 @@
 #include "VideoComposite.h"
+#include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/gl/gl.h>
 #include <gst/rtp/rtp.h>    // parse RTP headers and extensions
@@ -8,10 +9,46 @@
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <iostream>      // for std::cerr
 
 
 // static member definition
 VideoComposite *VideoComposite::s_instance = nullptr;
+
+// bus watch callback used in run_pipeline; reports errors/warnings from
+// elements (GL shader compile issues typically show up here).
+static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer /*user_data*/)
+{
+    switch (GST_MESSAGE_TYPE(msg)) {
+    case GST_MESSAGE_ERROR: {
+        GError *err = nullptr;
+        gchar *dbg = nullptr;
+        gst_message_parse_error(msg, &err, &dbg);
+        g_printerr("[gst] ERROR from %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+        if (dbg) {
+            g_printerr("[gst] Debug info: %s\n", dbg);
+            g_free(dbg);
+        }
+        g_error_free(err);
+        break;
+    }
+    case GST_MESSAGE_WARNING: {
+        GError *err = nullptr;
+        gchar *dbg = nullptr;
+        gst_message_parse_warning(msg, &err, &dbg);
+        g_printerr("[gst] WARNING from %s: %s\n", GST_OBJECT_NAME(msg->src), err->message);
+        if (dbg) {
+            g_printerr("[gst] Debug info: %s\n", dbg);
+            g_free(dbg);
+        }
+        g_error_free(err);
+        break;
+    }
+    default:
+        break;
+    }
+    return TRUE; /* keep bus watch alive */
+}
 
 // probe that reads one‑byte RFC5285 extension id=1 carrying 64-bit microsecond
 // timestamp and prints it alongside sequence number.
@@ -50,6 +87,10 @@ static GstPadProbeReturn rtp_timestamp_probe(GstPad *pad, GstPadProbeInfo *info,
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                    const std::vector<int> &ports)
     : pipeline(nullptr), mix_element(nullptr), live_k1(0.3f), live_zoom(1.1f),
+      live_w(0.0f), live_h(0.0f),
+      live_h00(1.0f), live_h01(0.0f), live_h02(0.0f),
+      live_h10(0.0f), live_h11(1.0f), live_h12(0.0f),
+      live_h20(0.0f), live_h21(0.0f), live_h22(1.0f),
       // default to four incoming UDP streams; we add a separate background
       // videotestsrc below rather than counting it here.
       num_src(0), uniforms(nullptr), stab(), branch_active() {
@@ -61,22 +102,41 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
     // load shader file
     std::ifstream in(shaderPath);
     if (!in) {
-        throw std::runtime_error("failed to open shader file " + shaderPath);
+        std::string msg = "failed to open shader file '" + shaderPath + "'";
+        // log unconditionally so we see the bad path even if the exception is
+        // accidentally swallowed further up the call chain.
+        std::cerr << msg << "\n";
+        throw std::runtime_error(msg);
     }
     std::ostringstream buf;
     buf << in.rdbuf();
     shader_code = buf.str();
     if (shader_code.empty()) {
-        throw std::runtime_error("shader file " + shaderPath + " is empty");
+        std::string msg = "shader file '" + shaderPath + "' is empty";
+        std::cerr << msg << "\n";
+        throw std::runtime_error(msg);
     }
     /* allocate and clear vector to match num_src; entries beyond
        num_src are not used */
     stab.assign(num_src, nullptr);
 
-    /* prepare the uniforms structure once and reuse it */
+    /* prepare the uniforms structure once and reuse it; include every
+       value the shader might reference so that the structure can be updated
+       in one place later.  the matrix defaults correspond to identity. */
     uniforms = gst_structure_new("uniforms",
                                  "k1", G_TYPE_FLOAT, live_k1,
                                  "zoom", G_TYPE_FLOAT, live_zoom,
+                                 "w", G_TYPE_FLOAT, live_w,
+                                 "h", G_TYPE_FLOAT, live_h,
+                                 "h00", G_TYPE_FLOAT, live_h00,
+                                 "h01", G_TYPE_FLOAT, live_h01,
+                                 "h02", G_TYPE_FLOAT, live_h02,
+                                 "h10", G_TYPE_FLOAT, live_h10,
+                                 "h11", G_TYPE_FLOAT, live_h11,
+                                 "h12", G_TYPE_FLOAT, live_h12,
+                                 "h20", G_TYPE_FLOAT, live_h20,
+                                 "h21", G_TYPE_FLOAT, live_h21,
+                                 "h22", G_TYPE_FLOAT, live_h22,
                                  NULL);
 }
 
@@ -109,18 +169,51 @@ void VideoComposite::start() {
 
 // setter helpers -----------------------------------------------------------
 
-void VideoComposite::setUniforms(float k1, float zoom) {
+void VideoComposite::setUniforms(float k1,
+                                    float zoom,
+                                    float w,
+                                    float h,
+                                    float h00, float h01, float h02,
+                                    float h10, float h11, float h12,
+                                    float h20, float h21, float h22) {
     live_k1 = k1;
     live_zoom = zoom;
+    live_w = w;
+    live_h = h;
+    live_h00 = h00; live_h01 = h01; live_h02 = h02;
+    live_h10 = h10; live_h11 = h11; live_h12 = h12;
+    live_h20 = h20; live_h21 = h21; live_h22 = h22;
     if (uniforms) {
         gst_structure_set(uniforms,
                           "k1", G_TYPE_FLOAT, live_k1,
                           "zoom", G_TYPE_FLOAT, live_zoom,
+                          "w", G_TYPE_FLOAT, live_w,
+                          "h", G_TYPE_FLOAT, live_h,
+                          "h00", G_TYPE_FLOAT, live_h00,
+                          "h01", G_TYPE_FLOAT, live_h01,
+                          "h02", G_TYPE_FLOAT, live_h02,
+                          "h10", G_TYPE_FLOAT, live_h10,
+                          "h11", G_TYPE_FLOAT, live_h11,
+                          "h12", G_TYPE_FLOAT, live_h12,
+                          "h20", G_TYPE_FLOAT, live_h20,
+                          "h21", G_TYPE_FLOAT, live_h21,
+                          "h22", G_TYPE_FLOAT, live_h22,
                           NULL);
     } else {
         uniforms = gst_structure_new("uniforms",
                                      "k1", G_TYPE_FLOAT, live_k1,
                                      "zoom", G_TYPE_FLOAT, live_zoom,
+                                     "w", G_TYPE_FLOAT, live_w,
+                                     "h", G_TYPE_FLOAT, live_h,
+                                     "h00", G_TYPE_FLOAT, live_h00,
+                                     "h01", G_TYPE_FLOAT, live_h01,
+                                     "h02", G_TYPE_FLOAT, live_h02,
+                                     "h10", G_TYPE_FLOAT, live_h10,
+                                     "h11", G_TYPE_FLOAT, live_h11,
+                                     "h12", G_TYPE_FLOAT, live_h12,
+                                     "h20", G_TYPE_FLOAT, live_h20,
+                                     "h21", G_TYPE_FLOAT, live_h21,
+                                     "h22", G_TYPE_FLOAT, live_h22,
                                      NULL);
     }
 }
@@ -145,6 +238,10 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     float k1 = 0.3f + (sin(time_t) * 1.0f);
     float zoom = 1.1f;
 
+    /* the remaining uniforms (w, h, homography entries) are left at their
+       previously configured values; if you need to change them dynamically you
+       can either call setUniforms() with the new values or add separate
+       helper methods. */
     self->setUniforms(k1, zoom);
 
     /* push updated uniforms into all shader elements */
@@ -161,8 +258,8 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     for (int i = 0; i < self->num_src && i < (int)self->stab.size(); i++) {
         if (self->stab[i]) {
             g_object_set(self->stab[i],
-                         "translation-x", sway_x,
-                         "translation-y", sway_y,
+                         "translation-x", 0.0f,
+                         "translation-y", 0.0f,
                          NULL);
         }
     }
@@ -401,6 +498,14 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         self->stab[i] = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
     }
 
+    /* install bus watch so we can see errors/warnings from any element (e.g.
+       shader compilation failures).  message callback will continue running
+       until the pipeline is torn down. */
+    {
+        GstBus *bus = gst_element_get_bus(self->pipeline);
+        gst_bus_add_watch(bus, bus_call, nullptr);
+        gst_object_unref(bus);
+    }
 
     gst_element_set_state(self->pipeline, GST_STATE_PLAYING);
 
