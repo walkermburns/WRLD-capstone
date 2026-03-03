@@ -26,13 +26,41 @@ int main()
 
     std::cout << "[main] base IP=" << cfg.global.baseLanIp << "\n";
 
+    // prepare shader and video port list early so we can construct the
+    // VideoComposite before wiring up the IMU callbacks.
+    std::string shaderPath = "../src/warp.frag";
+    if (!std::filesystem::exists(shaderPath)) {
+        std::cerr << "[main] shader path does not exist: '" << shaderPath
+                  << "' (cwd=" << std::filesystem::current_path() << ")\n";
+    }
+
+    std::vector<int> videoPorts;
+    for (auto &n : cfg.targets) {
+        if (n.videoPort != 0) {
+            videoPorts.push_back(n.videoPort);
+        } else {
+            std::cerr << "[main] warning: node '" << n.name
+                      << "' has no videoPort, skipping" << "\n";
+        }
+    }
+
+    // construct composite prior to node creation so callback lambdas can
+    // capture it by reference.
+    VideoComposite vc(shaderPath, videoPorts);
+
     std::vector<std::unique_ptr<BuoyNode>> nodes;
     for (auto &n : cfg.targets) {
         if (n.imuPort == 0) {
             std::cerr << "[main] warning: node '" << n.name << "' has no imu_port\n";
             continue;
         }
-        auto node = std::make_unique<BuoyNode>(n.name, n.imuPort);
+
+        // callback updates the composite's quaternion state
+        BuoyNode::Callback cb = [&vc](const std::string & /*name*/, const buoy_proto::IMU_proto &msg) {
+            vc.updateQuaternion(msg);
+        };
+
+        auto node = std::make_unique<BuoyNode>(n.name, n.imuPort, cb);
         if (node->start()) {
             std::cout << "[main] listening for " << n.name << " on port "
                       << n.imuPort << "\n";
@@ -43,24 +71,6 @@ int main()
     }
 
     try {
-        std::string shaderPath = "../src/warp.frag";
-        // quickly verify the file exists using C++17 filesystem so we can
-        // diagnose bad relative paths before VideoComposite is constructed.
-        if (!std::filesystem::exists(shaderPath)) {
-            std::cerr << "[main] shader path does not exist: '" << shaderPath
-                      << "' (cwd=" << std::filesystem::current_path() << ")\n";
-        }
-
-        std::vector<int> videoPorts;
-        for (auto &n : cfg.targets) {
-            if (n.videoPort != 0) {
-                videoPorts.push_back(n.videoPort);
-            } else {
-                std::cerr << "[main] warning: node '" << n.name
-                          << "' has no videoPort, skipping" << "\n";
-            }
-        }
-        VideoComposite vc(shaderPath, videoPorts);
         vc.start();
     } catch (const std::exception &e) {
         std::cerr << "VideoComposite error: " << e.what() << "\n";
