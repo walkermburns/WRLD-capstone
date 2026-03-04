@@ -1,4 +1,7 @@
 #include "VideoComposite.h"
+#include "MathHelpers.h"   // quaternion/matrix math moved out of class
+#include "BuoyNode.h"      // need full definition for getQuaternion
+
 #include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/gl/gl.h>
@@ -10,7 +13,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <iostream>      // for std::cerr
-#include <algorithm>     // for std::clamp
+
+using namespace MathHelpers; // bring helpers into current namespace
 
 
 // static member definition
@@ -51,128 +55,9 @@ static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer /*user_data*/)
     return TRUE; /* keep bus watch alive */
 }
 
-// simple quaternion/matrix helpers ------------------------------------------------
-VideoComposite::Quaternion VideoComposite::quat_inverse(const VideoComposite::Quaternion &q)
-{
-    VideoComposite::Quaternion r;
-    r.w = q.w;
-    r.x = -q.x;
-    r.y = -q.y;
-    r.z = -q.z;
-    return r;
-}
-
-VideoComposite::Quaternion VideoComposite::quat_mult(const VideoComposite::Quaternion &a,
-                                            const VideoComposite::Quaternion &b)
-{
-    VideoComposite::Quaternion r;
-    r.w = a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z;
-    r.x = a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y;
-    r.y = a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x;
-    r.z = a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w;
-    return r;
-}
-
-// convert quaternion to yaw/pitch/roll following Arduino ZYX convention
-void VideoComposite::ypr_from_quat(const Quaternion &q, float &yaw, float &pitch, float &roll)
-{
-    // reference implementation from vid_stab/cpp/stab_math.hpp
-    float w = q.w;
-    float x = q.x;
-    float y = q.y;
-    float z = q.z;
-
-    // roll (x-axis rotation)
-    float sinr_cosp = 2.0f * (w*x + y*z);
-    float cosr_cosp = 1.0f - 2.0f * (x*x + y*y);
-    roll = std::atan2(sinr_cosp, cosr_cosp);
-
-    // pitch (y-axis rotation)
-    float sinp = 2.0f * (w*y - z*x);
-    if (std::abs(sinp) >= 1.0f)
-        pitch = std::copysign(M_PI/2.0f, sinp);
-    else
-        pitch = std::asin(sinp);
-
-    // yaw (z-axis rotation)
-    float siny_cosp = 2.0f * (w*z + x*y);
-    float cosy_cosp = 1.0f - 2.0f * (y*y + z*z);
-    yaw = std::atan2(siny_cosp, cosy_cosp);
-}
-
-// 3x3 matrix utilities ------------------------------------------------------
-void VideoComposite::make_K(float w, float h, float hfov_deg, float outK[9])
-{
-    float fx = 0.5f * w / tanf(hfov_deg * (M_PI/180.0f) * 0.5f);
-    float fy = fx;
-    float cx = 0.5f * w;
-    float cy = 0.5f * h;
-    outK[0] = fx;  outK[1] = 0.0f; outK[2] = cx;
-    outK[3] = 0.0f; outK[4] = fy;  outK[5] = cy;
-    outK[6] = 0.0f; outK[7] = 0.0f; outK[8] = 1.0f;
-}
-
-void VideoComposite::mult3x3(const float a[9], const float b[9], float out[9])
-{
-    for (int r = 0; r < 3; ++r) {
-        for (int c = 0; c < 3; ++c) {
-            out[r*3 + c] = a[r*3+0]*b[0*3+c] + a[r*3+1]*b[1*3+c] + a[r*3+2]*b[2*3+c];
-        }
-    }
-}
-
-void VideoComposite::transpose3x3(const float a[9], float out[9])
-{
-    out[0] = a[0]; out[1] = a[3]; out[2] = a[6];
-    out[3] = a[1]; out[4] = a[4]; out[5] = a[7];
-    out[6] = a[2]; out[7] = a[5]; out[8] = a[8];
-}
-
-bool VideoComposite::invert3x3(const float m[9], float out[9])
-{
-    float det = m[0]*(m[4]*m[8] - m[5]*m[7])
-              - m[1]*(m[3]*m[8] - m[5]*m[6])
-              + m[2]*(m[3]*m[7] - m[4]*m[6]);
-    if (fabs(det) < 1e-9f)
-        return false;
-    float invdet = 1.0f / det;
-    out[0] =  (m[4]*m[8] - m[5]*m[7]) * invdet;
-    out[1] = -(m[1]*m[8] - m[2]*m[7]) * invdet;
-    out[2] =  (m[1]*m[5] - m[2]*m[4]) * invdet;
-    out[3] = -(m[3]*m[8] - m[5]*m[6]) * invdet;
-    out[4] =  (m[0]*m[8] - m[2]*m[6]) * invdet;
-    out[5] = -(m[0]*m[5] - m[2]*m[3]) * invdet;
-    out[6] =  (m[3]*m[7] - m[4]*m[6]) * invdet;
-    out[7] = -(m[0]*m[7] - m[1]*m[6]) * invdet;
-    out[8] =  (m[0]*m[4] - m[1]*m[3]) * invdet;
-    return true;
-}
-
-bool VideoComposite::homography_is_safe(const float Hinv[9], float w, float h)
-{
-    // sample a 3x3 grid spanning the image
-    float xs[3] = {0.0f, (w - 1.0f) * 0.5f, w - 1.0f};
-    float ys[3] = {0.0f, (h - 1.0f) * 0.5f, h - 1.0f};
-    float limit = 5.0f * std::max(w, h);
-
-    for (int iy = 0; iy < 3; ++iy) {
-        for (int ix = 0; ix < 3; ++ix) {
-            float x = xs[ix];
-            float y = ys[iy];
-            // multiply Hinv by [x y 1]^T
-            float qx = Hinv[0]*x + Hinv[1]*y + Hinv[2];
-            float qy = Hinv[3]*x + Hinv[4]*y + Hinv[5];
-            float qz = Hinv[6]*x + Hinv[7]*y + Hinv[8];
-            if (fabs(qz) < 1e-2f)
-                return false;
-            float uvx = qx / qz;
-            float uvy = qy / qz;
-            if (fabs(uvx) > limit || fabs(uvy) > limit)
-                return false;
-        }
-    }
-    return true;
-}
+// NOTE: quaternion/matrix helpers have been moved to MathHelpers.{h,cpp}
+// so we no longer define them here.  VideoComposite.cpp simply includes the
+// header and uses the free functions via namespace MathHelpers.
 
 // probe that reads one‑byte RFC5285 extension id=1 carrying 64-bit microsecond
 // timestamp and prints it alongside sequence number.
@@ -217,24 +102,15 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
       live_h20(0.0f), live_h21(0.0f), live_h22(1.0f),
       // default to four incoming UDP streams; we add a separate background
       // videotestsrc below rather than counting it here.
-      num_src(0), uniforms(nullptr), stab(), branch_active(), quat_() {
+      num_src(0), uniforms(nullptr), stab(), branch_active(), quat_(), nodes_(nullptr) {
     // copy port list and derive source count
     video_ports = ports;
     num_src = static_cast<int>(video_ports.size());
     stab.assign(num_src, nullptr);
     branch_active.assign(num_src, false);
 
-    // compute camera matrices used for homography (defaults from the
-    // header are used; you can expose setters if you need to change them)
-    make_K(cam_w, cam_h, cam_hfov_deg, K);
-    invert3x3(K, Kinv);
-    // FLU -> OpenCV conversion hard‑coded
-    Rflu2cv_mat[0] = 0.0f;  Rflu2cv_mat[1] = -1.0f; Rflu2cv_mat[2] = 0.0f;
-    Rflu2cv_mat[3] = 0.0f;  Rflu2cv_mat[4] =  0.0f; Rflu2cv_mat[5] = -1.0f;
-    Rflu2cv_mat[6] = 1.0f;  Rflu2cv_mat[7] =  0.0f; Rflu2cv_mat[8] =  0.0f;
-    // identity fallback homography
-    for (int i = 0; i < 9; ++i)
-        last_good_Hinv[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+    // (camera matrix initialization is now handled inside BuoyNode; not
+    // needed here)
 
     // load shader file
     std::ifstream in(shaderPath);
@@ -256,6 +132,10 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
     /* allocate and clear vector to match num_src; entries beyond
        num_src are not used */
     stab.assign(num_src, nullptr);
+
+    // note: nodes_ pointer will be configured by caller afterwards via
+    // setBuoyNodes().  we intentionally do not try to access it here since
+    // main may not have created the nodes vector yet.
 
     /* prepare the uniforms structure once and reuse it; include every
        value the shader might reference so that the structure can be updated
@@ -282,24 +162,6 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
                                  "h20", G_TYPE_FLOAT, live_h20,
                                  "h21", G_TYPE_FLOAT, live_h21,
                                  "h22", G_TYPE_FLOAT, live_h22,
-                                 "r00", G_TYPE_FLOAT, r00,
-                                 "r01", G_TYPE_FLOAT, r01,
-                                 "r02", G_TYPE_FLOAT, r02,
-                                 "r10", G_TYPE_FLOAT, r10,
-                                 "r11", G_TYPE_FLOAT, r11,
-                                 "r12", G_TYPE_FLOAT, r12,
-                                 "r20", G_TYPE_FLOAT, r20,
-                                 "r21", G_TYPE_FLOAT, r21,
-                                 "r22", G_TYPE_FLOAT, r22,
-                                 "ir00", G_TYPE_FLOAT, ir00,
-                                 "ir01", G_TYPE_FLOAT, ir01,
-                                 "ir02", G_TYPE_FLOAT, ir02,
-                                 "ir10", G_TYPE_FLOAT, ir10,
-                                 "ir11", G_TYPE_FLOAT, ir11,
-                                 "ir12", G_TYPE_FLOAT, ir12,
-                                 "ir20", G_TYPE_FLOAT, ir20,
-                                 "ir21", G_TYPE_FLOAT, ir21,
-                                 "ir22", G_TYPE_FLOAT, ir22,
                                  NULL);
 }
 
@@ -392,121 +254,80 @@ void VideoComposite::setUniforms(float k1,
 // protobuf message, updates our internal copy, and print them so we know the
 // callback is firing.
 void VideoComposite::updateQuaternion(const buoy_proto::IMU_proto &msg) {
+    // this helper is now primarily kept for legacy/testing; most clients
+    // will update quat_ via the nodes_ vector instead of a callback.
     quat_.w = msg.quat_w();
     quat_.x = msg.quat_x();
     quat_.y = msg.quat_y();
     quat_.z = msg.quat_z();
-
-    // std::cout << "[VideoComposite] updateQuaternion called: "
-    //           << "w=" << quat_.w << " x=" << quat_.x
-    //           << " y=" << quat_.y << " z=" << quat_.z << "\n";
 }
 
 // static callbacks ----------------------------------------------------------
 
 /* pad probe that runs once for each buffer passing through the mixer source.
-   We use it to update fake IMU state and propagate uniforms/transforms. */
-
+       We use it to fetch the latest orientation from the first buoy node (if one
+       has been provided) and propagate uniforms/transforms. */
 GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                                gpointer user_data) {
     if (!(info->type & GST_PAD_PROBE_TYPE_BUFFER))
         return GST_PAD_PROBE_OK;
     VideoComposite *self = static_cast<VideoComposite *>(user_data);
 
-    // ensure we have a reference quaternion (captured on first buffer)
-    if (!self->have_ref) {
-        self->quat_ref = self->quat_;
-        self->have_ref = true;
-        std::cout << "[VideoComposite] captured reference orientation\n";
-    }
+    // precompute Hinv for each source (identity if missing).  also
+    // respect IMU_ALL environment variable which forces a single node's
+    // matrix to be applied to all shaders.
+    std::vector<std::array<float,9>> hinvs(self->num_src);
 
-    // compute relative rotation q_rel = q_cur * inv(q_ref)
-    Quaternion q_ref_inv = quat_inverse(self->quat_ref);
-    Quaternion q_rel = quat_mult(self->quat_, q_ref_inv);
-
-    float yaw, pitch, roll;
-    ypr_from_quat(q_rel, yaw, pitch, roll);
-
-    // compute corrective pitch/roll (negative of measured tilt)
-    const float GAIN = 1.0f;
-    const float MAX_TILT_RAD = static_cast<float>(35.0 * M_PI / 180.0);
-    float pitch_c = std::clamp(-GAIN * pitch, -MAX_TILT_RAD, MAX_TILT_RAD);
-    float roll_c  = std::clamp(-GAIN * roll,  -MAX_TILT_RAD, MAX_TILT_RAD);
-
-    // apply smoothing if requested (alpha<1), mirroring Python version
-    if (self->corr_smooth_alpha < 1.0f) {
-        // move filtered values towards current by factor alpha
-        self->corr_pitch_filt += self->corr_smooth_alpha * (pitch_c - self->corr_pitch_filt);
-        self->corr_roll_filt  += self->corr_smooth_alpha * (roll_c  - self->corr_roll_filt);
-        pitch_c = self->corr_pitch_filt;
-        roll_c  = self->corr_roll_filt;
-    } else {
-        // keep filter state up-to-date so changes to alpha are smooth
-        self->corr_pitch_filt = pitch_c;
-        self->corr_roll_filt  = roll_c;
-    }
-
-    // build 3x3 rotation matrix for R_corr = Ry(pitch_c)*Rx(roll_c)
-    float cp = cosf(pitch_c);
-    float sp = sinf(pitch_c);
-    float cr = cosf(roll_c);
-    float sr = sinf(roll_c);
-    float R_corr[9];
-    R_corr[0] = cp;
-    R_corr[1] = sp * sr;
-    R_corr[2] = sp * cr;
-    R_corr[3] = 0.0f;
-    R_corr[4] = cr;
-    R_corr[5] = -sr;
-    R_corr[6] = -sp;
-    R_corr[7] = cp * sr;
-    R_corr[8] = cp * cr;
-
-    // convert to OpenCV coord system and form homography
-    float R_corr_inv[9];
-    transpose3x3(R_corr, R_corr_inv);
-    float temp[9];
-    mult3x3(self->Rflu2cv_mat, R_corr_inv, temp);
-    float R_stab_cv[9];
-    float Rflu2cv_T[9];
-    transpose3x3(self->Rflu2cv_mat, Rflu2cv_T);
-    mult3x3(temp, Rflu2cv_T, R_stab_cv);
-
-    float H[9];
-    mult3x3(self->K, R_stab_cv, temp);
-    mult3x3(temp, self->Kinv, H);
-
-    float Hinv[9];
-    bool valid = invert3x3(H, Hinv);
-    if (valid) {
-        // basic finite check plus homography safety
-        for (int i = 0; i < 9; ++i) {
-            if (!std::isfinite(Hinv[i])) {
-                valid = false;
-                break;
-            }
+    // check IMU_ALL once per call; console might set/unset at runtime
+    int forceIndex = -1;
+    const char *env = getenv("IMU_ALL");
+    if (env) {
+        char *end;
+        long v = strtol(env, &end, 10);
+        if (end != env && v >= 0 && v < self->num_src) {
+            forceIndex = static_cast<int>(v);
         }
-        if (valid && !homography_is_safe(Hinv, self->cam_w, self->cam_h))
-            valid = false;
     }
-    if (!valid) {
-        // fall back to last good matrix (initialized to identity)
-        memcpy(Hinv, self->last_good_Hinv, sizeof(Hinv));
-    } else {
-        memcpy(self->last_good_Hinv, Hinv, sizeof(Hinv));
+
+    for (int i = 0; i < self->num_src; ++i) {
+        int idx = (forceIndex >= 0) ? forceIndex : i;
+        if (self->nodes_ && idx < (int)self->nodes_->size()) {
+            auto mat = (*self->nodes_)[idx]->getHinv();
+            for (int j = 0; j < 9; ++j)
+                hinvs[i][j] = mat[j];
+        } else {
+            for (int j = 0; j < 9; ++j)
+                hinvs[i][j] = (j % 4 == 0) ? 1.0f : 0.0f;
+        }
     }
 
     // set the uniforms (keep k1/zoom constant for now)
     float k1 = self->live_k1;
     float zoom = self->live_zoom;
-    self->setUniforms(k1, zoom,
-                      self->cam_w, self->cam_h,
-                      Hinv[0], Hinv[1], Hinv[2],
-                      Hinv[3], Hinv[4], Hinv[5],
-                      Hinv[6], Hinv[7], Hinv[8]);
+    // camera dimensions are fixed (hard-coded to match BuoyNode defaults)
 
-    /* push updated uniforms into all shader elements */
+    /* push updated uniforms into each shader element individually, so that
+       each branch uses its own matrix.  we update the shared gst_structure
+       for convenience before applying to each shader. */
     for (int i = 0; i < self->num_src; i++) {
+        // update homography entries
+        const auto &H = hinvs[i];
+        gst_structure_set(self->uniforms,
+                          "k1", G_TYPE_FLOAT, k1,
+                          "zoom", G_TYPE_FLOAT, zoom,
+                          "w", G_TYPE_FLOAT, 1920.0f,
+                          "h", G_TYPE_FLOAT, 1080.0f,
+                          "h00", G_TYPE_FLOAT, H[0],
+                          "h01", G_TYPE_FLOAT, H[1],
+                          "h02", G_TYPE_FLOAT, H[2],
+                          "h10", G_TYPE_FLOAT, H[3],
+                          "h11", G_TYPE_FLOAT, H[4],
+                          "h12", G_TYPE_FLOAT, H[5],
+                          "h20", G_TYPE_FLOAT, H[6],
+                          "h21", G_TYPE_FLOAT, H[7],
+                          "h22", G_TYPE_FLOAT, H[8],
+                          NULL);
+
         char name[16];
         snprintf(name, sizeof(name), "lens%d", i);
         GstElement *shader = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
@@ -529,6 +350,8 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
 }
 
 void *VideoComposite::run_pipeline(gpointer user_data) {
+    // nothing special here, but we might in future forward nodes to the
+    // thread etc.
     VideoComposite *self = static_cast<VideoComposite *>(user_data);
     if (!self) {
         // fallback to static instance (macOS behaviour can be weird)
@@ -783,4 +606,12 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     g_main_loop_unref(loop);
 
     return NULL;
+}
+
+
+// ---------------------------------------------------------------------------
+// new methods
+
+void VideoComposite::setBuoyNodes(std::vector<std::unique_ptr<BuoyNode>> *nodes) {
+    nodes_ = nodes;
 }

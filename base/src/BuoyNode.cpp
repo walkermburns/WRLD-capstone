@@ -7,13 +7,16 @@
 #include <unordered_map>
 #include <chrono>
 
+using namespace MathHelpers; // simplify quaternion/matrix calls
+
 // static member definitions
 std::mutex BuoyNode::printMutex;
 
 BuoyNode::BuoyNode(std::string name, int imuPort, Callback cb)
     : name_(std::move(name)), imuPort_(imuPort), sock_(-1), callback_(std::move(cb)),
-      running_(false)
+      running_(false), lastQuat_()
 {
+    initCameraMatrices();
 }
 
 BuoyNode::BuoyNode(std::string name, int imuPort)
@@ -123,10 +126,56 @@ void BuoyNode::receiveLoop()
             continue;
         }
 
+        // compute quaternion and homography together under lock using helper
+        {
+            std::lock_guard<std::mutex> lock(quatMutex_);
+            lastQuat_.w = msg.quat_w();
+            lastQuat_.x = msg.quat_x();
+            lastQuat_.y = msg.quat_y();
+            lastQuat_.z = msg.quat_z();
+
+            float Hinv[9];
+            bool ok = compute_homography_from_quat(lastQuat_, quat_ref, have_ref,
+                                                   corr_smooth_alpha,
+                                                   corr_pitch_filt, corr_roll_filt,
+                                                   Rflu2cv_mat, K, Kinv,
+                                                   cam_w, cam_h, Hinv);
+            if (ok) {
+                for (int i = 0; i < 9; ++i)
+                    lastHinv_[i] = Hinv[i];
+            }
+        }
+
         if (callback_) {
             callback_(name_, msg);
         }
     }
+}
+
+// helper ---------------------------------------------------------------
+
+void BuoyNode::initCameraMatrices() {
+    // delegate to MathHelpers helper for consistency with VideoComposite
+    init_camera_matrices(cam_w, cam_h, cam_hfov_deg, K, Kinv,
+                         Rflu2cv_mat, last_good_Hinv);
+    // also set our public storage to identity
+    for (int i = 0; i < 9; ++i)
+        lastHinv_[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+}
+
+// accessor ---------------------------------------------------------------
+
+MathHelpers::Quaternion BuoyNode::getQuaternion() const {
+    std::lock_guard<std::mutex> lock(quatMutex_);
+    return lastQuat_;
+}
+
+std::array<float,9> BuoyNode::getHinv() const {
+    std::array<float,9> out;
+    std::lock_guard<std::mutex> lock(quatMutex_);
+    for (int i = 0; i < 9; ++i)
+        out[i] = lastHinv_[i];
+    return out;
 }
 
 // static helper -------------------------------------------------------------

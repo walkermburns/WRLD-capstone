@@ -27,7 +27,8 @@ int main()
     std::cout << "[main] base IP=" << cfg.global.baseLanIp << "\n";
 
     // prepare shader and video port list early so we can construct the
-    // VideoComposite before wiring up the IMU callbacks.
+    // VideoComposite before creating buoy nodes.  the composite will later be
+    // given a reference to the node vector (no callbacks needed).
     std::string shaderPath = "../src/warp.frag";
     if (!std::filesystem::exists(shaderPath)) {
         std::cerr << "[main] shader path does not exist: '" << shaderPath
@@ -44,8 +45,8 @@ int main()
         }
     }
 
-    // construct composite prior to node creation so callback lambdas can
-    // capture it by reference.
+    // construct composite prior to node creation.  we'll hand the node
+    // vector to it later so it can poll the first entry in imu_probe_cb.
     VideoComposite vc(shaderPath, videoPorts);
 
     std::vector<std::unique_ptr<BuoyNode>> nodes;
@@ -55,12 +56,7 @@ int main()
             continue;
         }
 
-        // callback updates the composite's quaternion state
-        BuoyNode::Callback cb = [&vc](const std::string & /*name*/, const buoy_proto::IMU_proto &msg) {
-            vc.updateQuaternion(msg);
-        };
-
-        auto node = std::make_unique<BuoyNode>(n.name, n.imuPort, cb);
+        auto node = std::make_unique<BuoyNode>(n.name, n.imuPort);
         if (node->start()) {
             std::cout << "[main] listening for " << n.name << " on port "
                       << n.imuPort << "\n";
@@ -69,6 +65,9 @@ int main()
             std::cerr << "[main] failed to start node " << n.name << "\n";
         }
     }
+
+    // provide access to the node list for quaternion polling
+    vc.setBuoyNodes(&nodes);
 
     try {
         vc.start();

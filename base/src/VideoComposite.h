@@ -4,33 +4,41 @@
 #include <gst/gst.h>
 #include <gst/gl/gl.h> // for GstGLShader
 #include "buoy.pb.h"            // for IMU_proto message
+#include "MathHelpers.h"        // quaternion/matrix utilities
 #include <string>
 #include <vector>
+
+// forward declare BuoyNode so we can hold a pointer to the vector without
+// including its header (avoids circular dependency)
+class BuoyNode;
 
 class VideoComposite {
 public:
     // small helper type for quaternion state (w,x,y,z).  we avoid bringing
     // in Eigen here to keep the dependency list minimal; only a simple
     // struct is required for storage and callbacks.
-    struct Quaternion {
-        float w{1.0f};
-        float x{0.0f};
-        float y{0.0f};
-        float z{0.0f};
-    };
+    // quaternion stored by the IMU; alias to helpers type
+    using Quaternion = MathHelpers::Quaternion;
 
     // path to fragment shader read from disk and list of UDP ports
     explicit VideoComposite(const std::string &shaderPath,
                             const std::vector<int> &ports);
     ~VideoComposite();
 
+    // provide access to the list of buoy nodes maintained in main.  the
+    // composite will poll the first entry for its quaternion each frame.  the
+    // pointer is not owned; it must remain valid for the lifetime of the
+    // VideoComposite instance.
+    void setBuoyNodes(std::vector<std::unique_ptr<BuoyNode>> *nodes);
+
     // start the pipeline; on macOS this will be run from a secondary thread
     void start();
 
-    // update the stored quaternion from a protobuf IMU message.  this is
-    // the method that will be bound as a BuoyNode callback; for now it
-    // merely copies the values and prints them to stdout so we can verify
-    // it's being invoked.
+    // legacy helper: update the stored quaternion from a protobuf IMU
+    // message.  once H matrix support is fully working this will no longer
+    // be used; the compositor instead polls the BuoyNode for its precomputed
+    // homography.  for now it still offers a simple copy variant useful for
+    // testing.
     void updateQuaternion(const buoy_proto::IMU_proto &msg);
 
 private:
@@ -46,32 +54,22 @@ private:
     // runtime state tracking which branches have been linked
     std::vector<bool> branch_active;
 
+    // non-owning pointer to the IMU nodes vector held by main
+    std::vector<std::unique_ptr<BuoyNode>> *nodes_ = nullptr;
+
     // path/content of the distortion shader
     std::string shader_code;
 
     // shader uniforms (current live values)
     float live_k1;
     
-    // latest quaternion state from a buoy IMU message.  updated via
-    // updateQuaternion().  public getter kept simple if callers need to
-    // inspect values.
+    // (previously stored quaternion; no longer used when H matrix is
+    // obtained directly from BuoyNode.  kept here temporarily for
+    // backwards compatibility with updateQuaternion.)
     Quaternion quat_; 
 
     // camera intrinsics / homography bookkeeping --------------------------------
-    float cam_w = 1920.0f;          // image width used when building K
-    float cam_h = 1080.0f;          // image height
-    float cam_hfov_deg = 50.0f;     // horizontal field of view in degrees
-
-    // pre‑computed 3x3 matrices stored row-major (K, its inverse, and the
-    // FLU->CV conversion).  keeping them as plain arrays avoids pulling
-    // Eigen into the header; the implementation file can use whichever
-    // math helpers it likes.
-    float K[9];
-    float Kinv[9];
-    float Rflu2cv_mat[9];
-    float last_good_Hinv[9];   // remember last usable homography to avoid bad data
-    bool have_ref = false;     // whether quat_ref has been initialized
-    Quaternion quat_ref;
+    // (moved into BuoyNode; the composite no longer needs these values)
 
     float live_zoom;
     float live_w;
@@ -80,21 +78,10 @@ private:
     float live_h10, live_h11, live_h12;
     float live_h20, live_h21, live_h22;
 
-    // smoothing/filtering state (mirrors gst_warp_imu.py behaviour)
-    // 1.0 = no smoothing, values closer to 0 increase smoothing
-    float corr_smooth_alpha = 1.0f;
-    float corr_pitch_filt = 0.0f;
-    float corr_roll_filt = 0.0f;
 
-    // small helper routines implemented in VideoComposite.cpp
-    static void ypr_from_quat(const Quaternion &q, float &yaw, float &pitch, float &roll);
-    static Quaternion quat_inverse(const Quaternion &q);
-    static Quaternion quat_mult(const Quaternion &a, const Quaternion &b);
-    static void make_K(float w, float h, float hfov_deg, float outK[9]);
-    static void mult3x3(const float a[9], const float b[9], float out[9]);
-    static void transpose3x3(const float a[9], float out[9]);
-    static bool invert3x3(const float m[9], float out[9]);
-    static bool homography_is_safe(const float Hinv[9], float w, float h);
+
+    // quaternion/matrix helper functions are defined in MathHelpers
+    // (no need to redeclare here).  implementations live in MathHelpers.{h,cpp}
 
     static gboolean on_draw_signal(GstElement *glfilter, GstGLShader *shader,
                                    guint texture, guint width, guint height,
