@@ -55,6 +55,13 @@ public:
     // the same mutex as the quaternion so simultaneous access is safe.
     std::array<float,9> getHinv() const;
 
+    // lookup Hinv closest to a specific IMU timestamp.  returns true if a
+    // sample exists (i.e. we've received at least one message); output will
+    // contain the nearest matrix.  timestamps and history are maintained in
+    // microseconds.  The lookup does a linear scan of the stored window
+    // (bounded to ~100ms worth of data) which is small enough for 100Hz.
+    bool getHinvAt(uint64_t timestamp, std::array<float,9> &out) const;
+
 private:
     // mutex used by printMessage
     static std::mutex printMutex;
@@ -91,6 +98,11 @@ private:
     float corr_smooth_alpha = 1.0f;
     float corr_pitch_filt = 0.0f;
     float corr_roll_filt = 0.0f;
+
+    // history of recent Hinv matrices with associated IMU timestamps
+    // we store roughly 100ms of data at ~100Hz; deque chosen for efficient
+    // push/pop at both ends.
+    std::deque<std::pair<uint64_t,std::array<float,9>>> hist_;
 
     // helper to initialize camera matrices; called from constructors
     void initCameraMatrices();

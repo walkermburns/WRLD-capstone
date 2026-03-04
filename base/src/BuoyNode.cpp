@@ -143,6 +143,15 @@ void BuoyNode::receiveLoop()
             if (ok) {
                 for (int i = 0; i < 9; ++i)
                     lastHinv_[i] = Hinv[i];
+                // record timestamped matrix; keep only past ~100ms of samples
+                uint64_t ts = msg.timestamp();
+                hist_.emplace_back(ts, std::array<float,9>{});
+                for (int i = 0; i < 9; ++i)
+                    hist_.back().second[i] = Hinv[i];
+                // drop old entries (older than 100000us)
+                while (!hist_.empty() && ts > hist_.front().first + 100000ull) {
+                    hist_.pop_front();
+                }
             }
         }
 
@@ -176,6 +185,23 @@ std::array<float,9> BuoyNode::getHinv() const {
     for (int i = 0; i < 9; ++i)
         out[i] = lastHinv_[i];
     return out;
+}
+
+bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out) const {
+    std::lock_guard<std::mutex> lock(quatMutex_);
+    if (hist_.empty())
+        return false;
+    uint64_t bestDiff = UINT64_MAX;
+    bool found = false;
+    for (const auto &p : hist_) {
+        uint64_t diff = (p.first > timestamp) ? p.first - timestamp : timestamp - p.first;
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            out = p.second;
+            found = true;
+        }
+    }
+    return found;
 }
 
 // static helper -------------------------------------------------------------
