@@ -34,4 +34,25 @@ namespace IMUHelpers {
     return q;
 }
 
+::Quaternion quat_normalize(const ::Quaternion &q)
+{
+    float mag = std::sqrt(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+    if (mag < 1e-6f)
+        return ::Quaternion{1.0f, 0.0f, 0.0f, 0.0f};
+    return ::Quaternion{q.w/mag, q.x/mag, q.y/mag, q.z/mag};
+}
+
+::Quaternion quat_lerp(const ::Quaternion &a,
+                      const ::Quaternion &b,
+                      float alpha)
+{
+    // simple linear interpolation and normalise afterwards
+    ::Quaternion r;
+    r.w = a.w + alpha * (b.w - a.w);
+    r.x = a.x + alpha * (b.x - a.x);
+    r.y = a.y + alpha * (b.y - a.y);
+    r.z = a.z + alpha * (b.z - a.z);
+    return quat_normalize(r);
+}
+
 } // namespace IMUHelpers

@@ -83,9 +83,15 @@ const IMUData &BNO055Driver::readSensor()
     // ignore the sensor's fused quaternion and instead derive a simple
     // orientation from the accelerometer vector alone. yaw is forced to
     // zero since the accel can't determine heading.
-    data.quat = IMUHelpers::quat_from_accel(data.accel.x,
-                                            data.accel.y,
-                                            data.accel.z);
+    // compute raw orientation from accelerometer
+    ::Quaternion raw = IMUHelpers::quat_from_accel(data.accel.x,
+                                                    data.accel.y,
+                                                    data.accel.z);
+    // low‑pass filter the quaternion to reduce jitter; alpha controls
+    // responsiveness (0 = no update, 1 = immediate).  choose a small
+    // value so that high‑frequency noise is smoothed out.
+    constexpr float ALPHA = 0.1f;
+    data.quat = IMUHelpers::quat_lerp(data.quat, raw, ALPHA);
 
     return data;
 }

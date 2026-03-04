@@ -12,4 +12,13 @@ namespace IMUHelpers {
 // input components need not be normalised.
 ::Quaternion quat_from_accel(float ax, float ay, float az);
 
+// return a unit quaternion in the same direction as `q`.
+::Quaternion quat_normalize(const ::Quaternion &q);
+
+// linearly interpolate between two quaternions then normalise result.
+// alpha=0 returns `a`, alpha=1 returns `b`.
+::Quaternion quat_lerp(const ::Quaternion &a,
+                      const ::Quaternion &b,
+                      float alpha);
+
 } // namespace IMUHelpers
