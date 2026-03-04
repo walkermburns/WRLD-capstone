@@ -1,5 +1,8 @@
 #include "BNO055.h"
 
+// use the local helper implementation rather than pulling in the base
+// station's MathHelpers (which is not part of the buoy project).
+#include "IMUHelpers.h"
 #include <unistd.h> // usleep
 #include <cstdio>
 
@@ -77,20 +80,12 @@ const IMUData &BNO055Driver::readSensor()
     data.gyro.y = gyrY / 16.0f;
     data.gyro.z = gyrZ / 16.0f;
 
-    uint8_t qdata[8];
-    if (transport.readRegister(BNO055_regs::Register::QUA_DATA, qdata,
-                               sizeof(qdata))) {
-        int16_t qw = (qdata[1] << 8) | qdata[0];
-        int16_t qx = (qdata[3] << 8) | qdata[2];
-        int16_t qy = (qdata[5] << 8) | qdata[4];
-        int16_t qz = (qdata[7] << 8) | qdata[6];
-
-        constexpr float scale = 1.0f / (1 << 14);
-        data.quat.w = qw * scale;
-        data.quat.x = qx * scale;
-        data.quat.y = qy * scale;
-        data.quat.z = qz * scale;
-    }
+    // ignore the sensor's fused quaternion and instead derive a simple
+    // orientation from the accelerometer vector alone. yaw is forced to
+    // zero since the accel can't determine heading.
+    data.quat = IMUHelpers::quat_from_accel(data.accel.x,
+                                            data.accel.y,
+                                            data.accel.z);
 
     return data;
 }
