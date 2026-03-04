@@ -80,6 +80,12 @@ private:
     float live_h10, live_h11, live_h12;
     float live_h20, live_h21, live_h22;
 
+    // smoothing/filtering state (mirrors gst_warp_imu.py behaviour)
+    // 1.0 = no smoothing, values closer to 0 increase smoothing
+    float corr_smooth_alpha = 1.0f;
+    float corr_pitch_filt = 0.0f;
+    float corr_roll_filt = 0.0f;
+
     // small helper routines implemented in VideoComposite.cpp
     static void ypr_from_quat(const Quaternion &q, float &yaw, float &pitch, float &roll);
     static Quaternion quat_inverse(const Quaternion &q);
@@ -88,6 +94,7 @@ private:
     static void mult3x3(const float a[9], const float b[9], float out[9]);
     static void transpose3x3(const float a[9], float out[9]);
     static bool invert3x3(const float m[9], float out[9]);
+    static bool homography_is_safe(const float Hinv[9], float w, float h);
 
     static gboolean on_draw_signal(GstElement *glfilter, GstGLShader *shader,
                                    guint texture, guint width, guint height,

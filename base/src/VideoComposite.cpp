@@ -148,6 +148,32 @@ bool VideoComposite::invert3x3(const float m[9], float out[9])
     return true;
 }
 
+bool VideoComposite::homography_is_safe(const float Hinv[9], float w, float h)
+{
+    // sample a 3x3 grid spanning the image
+    float xs[3] = {0.0f, (w - 1.0f) * 0.5f, w - 1.0f};
+    float ys[3] = {0.0f, (h - 1.0f) * 0.5f, h - 1.0f};
+    float limit = 5.0f * std::max(w, h);
+
+    for (int iy = 0; iy < 3; ++iy) {
+        for (int ix = 0; ix < 3; ++ix) {
+            float x = xs[ix];
+            float y = ys[iy];
+            // multiply Hinv by [x y 1]^T
+            float qx = Hinv[0]*x + Hinv[1]*y + Hinv[2];
+            float qy = Hinv[3]*x + Hinv[4]*y + Hinv[5];
+            float qz = Hinv[6]*x + Hinv[7]*y + Hinv[8];
+            if (fabs(qz) < 1e-2f)
+                return false;
+            float uvx = qx / qz;
+            float uvy = qy / qz;
+            if (fabs(uvx) > limit || fabs(uvy) > limit)
+                return false;
+        }
+    }
+    return true;
+}
+
 // probe that reads one‑byte RFC5285 extension id=1 carrying 64-bit microsecond
 // timestamp and prints it alongside sequence number.
 static GstPadProbeReturn rtp_timestamp_probe(GstPad *pad, GstPadProbeInfo *info,
@@ -407,6 +433,19 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     float pitch_c = std::clamp(-GAIN * pitch, -MAX_TILT_RAD, MAX_TILT_RAD);
     float roll_c  = std::clamp(-GAIN * roll,  -MAX_TILT_RAD, MAX_TILT_RAD);
 
+    // apply smoothing if requested (alpha<1), mirroring Python version
+    if (self->corr_smooth_alpha < 1.0f) {
+        // move filtered values towards current by factor alpha
+        self->corr_pitch_filt += self->corr_smooth_alpha * (pitch_c - self->corr_pitch_filt);
+        self->corr_roll_filt  += self->corr_smooth_alpha * (roll_c  - self->corr_roll_filt);
+        pitch_c = self->corr_pitch_filt;
+        roll_c  = self->corr_roll_filt;
+    } else {
+        // keep filter state up-to-date so changes to alpha are smooth
+        self->corr_pitch_filt = pitch_c;
+        self->corr_roll_filt  = roll_c;
+    }
+
     // build 3x3 rotation matrix for R_corr = Ry(pitch_c)*Rx(roll_c)
     float cp = cosf(pitch_c);
     float sp = sinf(pitch_c);
@@ -423,8 +462,6 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     R_corr[7] = cp * sr;
     R_corr[8] = cp * cr;
 
-    // optionally could smooth R_corr here (omitted for brevity)
-
     // convert to OpenCV coord system and form homography
     float R_corr_inv[9];
     transpose3x3(R_corr, R_corr_inv);
@@ -440,21 +477,23 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     mult3x3(temp, self->Kinv, H);
 
     float Hinv[9];
-    if (!invert3x3(H, Hinv)) {
-        memcpy(Hinv, self->last_good_Hinv, sizeof(Hinv));
-    } else {
-        // simple safety check: ensure finite
-        bool safe = true;
+    bool valid = invert3x3(H, Hinv);
+    if (valid) {
+        // basic finite check plus homography safety
         for (int i = 0; i < 9; ++i) {
             if (!std::isfinite(Hinv[i])) {
-                safe = false;
+                valid = false;
                 break;
             }
         }
-        if (!safe)
-            memcpy(Hinv, self->last_good_Hinv, sizeof(Hinv));
-        else
-            memcpy(self->last_good_Hinv, Hinv, sizeof(Hinv));
+        if (valid && !homography_is_safe(Hinv, self->cam_w, self->cam_h))
+            valid = false;
+    }
+    if (!valid) {
+        // fall back to last good matrix (initialized to identity)
+        memcpy(Hinv, self->last_good_Hinv, sizeof(Hinv));
+    } else {
+        memcpy(self->last_good_Hinv, Hinv, sizeof(Hinv));
     }
 
     // set the uniforms (keep k1/zoom constant for now)
