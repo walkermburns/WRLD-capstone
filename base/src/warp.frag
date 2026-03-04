@@ -25,9 +25,15 @@ void main() {
     q.z = h20*p.x + h21*p.y + h22;
 
     vec2 uv_pix = q.xy / q.z;
-    uv_pix = clamp(uv_pix, vec2(0.0), vec2(w - 1.0, h - 1.0));
-    vec2 uv = uv_pix / vec2(w, h);
 
+    // if outside the source image, output black to avoid interpolation artifacts
+    if (uv_pix.x < 0.0 || uv_pix.x > w - 1.0 || uv_pix.y < 0.0 || uv_pix.y > h - 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    // otherwise sample normally
+    vec2 uv = uv_pix / vec2(w, h);
     gl_FragColor = texture2D(tex, uv);
 }
 
