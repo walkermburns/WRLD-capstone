@@ -15,6 +15,8 @@ Buoy Functions:
 - Indicate status with LEDs?
 - Detect leaks?
 
+The buoy software is deployed using **scripts**, currently the command for this is `./deploy build`. The script will handle searching for nodes, verifying dependencies and network configuration, copying the files, and building. It will also eventually handle each of the running nodes, monitor for errors, and copy logs if needed
+
 ## Base Station Software
 The base station software will be much more complex. At the cost of reducing software complexity on each of the buoys (in the interest of reducing distributed development headaches and not dealing with the limited compute) The base station must pick up a lot of the slack.
 
@@ -33,148 +35,25 @@ Base station functions:
 
 Most of the heavy lifting of the base station software will be handled by GStreamer, an open platform that can handle the transmission of network video and live video compositing tasks using openGL plugins.
 
+To build,
+```
+# setup cmake directories
+cmake cmake -S src -B build
+# To build
+cd build
+make
+./base_station
+```
+Some debugging options have been added to the base station software, preceding the command with a flag will default all screens to use data from IMU source 1 for example:
+`IMU_ALL=0 ./base_station `
+
 ## Scripts
 Scripts will make or break the usability of Mora. In both development and deplyment, having to individually manage many devices is going to be a pain. We must be able to use scripts to deploy images to the Pis for development as well as to startup the system.
+
+## Configs
+There are two configuration files that are used for changing the behavior of the software, and this behavior can be altered without recompiling the program.
 
 # List of Software Dependencies
 - Gstreamer 1.0
 - libcamera
 - libyaml-cpp-dev
-
-## Software notes
-
-### Configs
-Config files will alow for easy changing of variables (maybe even without rebuilding).
-
-Mora.proto contains the protobuf message definitions for the system. This will mostly be used for IMU data as well as some other misc. statistics (hardware usage, leak detection, LED commands)
-
-targets.yaml describes each of the buoys with fields such as names, IPs, and whether the network is a bridged node. In this way, it will be used as a sort of network map to describe how each of the devices will connect to each other. Both the buoy scripts and the base station software will need to read from this yaml to determine how many nodes are active, what their IPs and ports will be, and any other hardware specifics.
-
-### GStreamer
-Gstreamer is a tool for creating video pipelines, pipelines are described by a !-separated list of descriptions for each of the pipeline stages, whether that be a source (video file or network stream), sink (destination - video player or recording), converters (that convert pixel formats RGB, YUV for different pipeline elements), or pads that allow input or output access on a pipeline. Documentation is available [here](https://gstreamer.freedesktop.org/documentation/tutorials/index.html?gi-language=c).
-
-Some notes on the software that we have defined so far:
-
-Afaik in gstreamer variables must be defined before they are used in pipelines, same as in code. This is why we define our video mixer and all of the sinks first, then the sources are sent to each of the sinks. In a traditional linear pipeline, there are not "variable" definitions, so the sink (such as filesink or appsink) can be defined at the end. When using named sinks or variables, these probably need to be first.
-
-Chat is taking a shortcut by using the text definition of the pipeline, gstreamer pipelines can be written and created in full c, but the way we have it written right now is that the pipeline is written in the !-separated format then parsed usign `gst_parse_launch`
-
-Because of this, there is a lot of extra code that is required to parse elements or handles from the string defintion since they have not been defined before in variables. `gst_bin_get_by_name(GST_BIN(data.pipeline)`
-
-The properties of elements/plugins are defined in the documentation. This is an example for [glshader](https://gstreamer.freedesktop.org/documentation/opengl/glshader.html?gi-language=c). This element has pads for input and output (sink and source), signals that can be connected directly to c variables using `g_signal_connect()`, and properties that can be read from or written to using `g_object_set()`.
-
-As there is no signal for updating the internal shader variables, we use uniform variables that can be updated externally by setting the 'uniforms' property between each frame. Currently we are creating the structure with this data, sending to the shader, then deleting or unreferencing the shader. This is all done in the imu update function.
-
-The image warping is performed by an openGL shader. the shader reads in a string or a .frag file that uses the openGL language to define the vector and matrix operations that will be performed on the image. idk anything about shaders yet lol
-
-# Raspberry Pi Setup
-
-## Network Manager
-Consistent UDP video streaming requries that the IP structure be set up correctly. Raspberry Pis use network manager to set up the network. I just completely nuked the default ethernet configuration and set up my own IPV4 static ip to make sure that there were no other issues.
-
-View current interface configurations with
-
-`nmcli con show`
-
-Clear existing hardware configuration with
-
-`nmcli con delete <connection_name>`
-
-Set up a new connection with static IP:
-```
-nmcli con add type ethernet \
-  ifname eth0 \
-  con-name eth0-static \
-  ipv4.method manual \
-  ipv4.addresses 192.168.1.10/24 \
-  ipv6.method disabled \
-  connection.autoconnect yes
-```
-
-Bring up the connection
-
-`nmcli con up eth0-static`
-
-# Creating a daisy-chain network with a dedicated subnet
-
-TODO: use network manager to set up a bridge between two network devices and 
-
-# Streaming video over UDP
-
-I used the following command to send UDP packets from the raspberry pi camera. The frames are encoded in h.264 using the raspberry pi hardware encoder.
-
-`rpicam-vid -t 0 --inline --width 1920 --height 1080 --framerate 30 --codec h264 --bitrate 5000000 -o udp://192.168.1.8:4444 -n`
-
-I then use ffmpeg to display the stream using this command:
-
-`ffplay udp://192.168.1.10:4444 -vf "setpts=N/30" -fflags nobuffer -flags low_delay -framedrop`
-
-To do CV on this stream, I will need to build a python or cpp app to pull the ffmpeg stream as frames
-
-# Raspberry Pi image pipeline
-
-With modern raspberry PIs there is no v4l2 driver available to make the camera appear as a webcam device. Instead, programs must use the modern libcamera to pull images from the cameras. This can be done using Gstreamer, LCCV, or the native libcamera API, although that is not recommended by gemini because of the difficulty of implementation.
-
-If we are changing colorspace to work with opencv, we will need to make sure that gstreamer, lccv, etc is utilizing the hardware ISP for that function.
-
-The Raspberry Pi has multiple hardware engines for image processing. The ISP already handles some color correction operations, but can also perform color space transformations that may be required to feed the footage into openCV.
-
-The ISP can be leveraged
-
-Once in openCV, we can use CPU functions to alter the image. We are interested in performing lens distortion correction (LDC) and image stabilization using an IMU.
-
-These operations can be pretty expensive, we will test to see how long they take on the Pi in CPU, but it is also possible to use the GPU to handle some of the corrections. [lens correction](https://forums.raspberrypi.com/viewtopic.php?t=288505) for one has been done using OpenGL ES. The ISP also has instructions to perform these functions but aren't exposed to the API? and are quite slow. Using GLES shaders should be able to perform lens correction and stabilization.
-
-Additionally, [Gstreamer](https://gemini.google.com/share/61ab6a969a65) can be used to perform some of these operations and is supposed to leverage the GPU. Yet to be determined is the cost of using the operations when it comes to memory handoff between the CPU and gpu (especially if memory has to be flushed from cache.)
-
-It may be possible to use Gstreamer for everything from capture to encode.
-
-# Gstreamer
-
-Current best working command:
-`gst-launch-1.0 -e libcamerasrc ! capsfilter caps=video/x-raw,width=1920,height=1080,format=NV12,interlace-mode=progressive ! v4l2h264enc extra-controls="controls,repeat_sequence_header=1" ! 'video/x-h264,level=(string)4' ! h264parse ! mp4mux ! filesink location = Downloads/test.mp4`
-
-Working pipeline for gl transformation
-`gst-launch-1.0 libcamerasrc ! video/x-raw,width=1280,height=720,format=NV12 ! \
-glupload ! glcolorconvert ! gltransformation rotation-z=180 ! \
-glimagesink`
-
-Turns out that chat says you cannot use the h264 encoder for anything that is not in the ISP memory space. Not sure if true, but was way to hard to get working.
-
-hardware encode command without any GL
-`gst-launch-1.0 -e libcamerasrc ! "video/x-raw,width=1920,height=1080,framerate=30/1" ! queue max-size-buffers=2 leaky=downstream ! v4l2h264enc extra-controls="controls,video_bitrate=5000000,repeat_sequence_header=1" ! "video/x-h264,level=(string)4" ! rtph264pay config-interval=1 pt=96 ! udpsink host=192.168.1.9 port=5000 sync=false`
-
-Was able to get up to 20Mbit
-`walker@raspberrypi:~/buoy/build $ gst-launch-1.0 -e libcamerasrc ! "video/x-raw,width=1920,height=1080,framerate=30/1" ! queue max-size-buffers=1 leaky=downstream ! v4l2h264enc extra-controls="controls,video_bitrate=20000000,repeat_sequence_header=1,iframe-period=30" ! "video/x-h264,level=(string)4" ! rtph2
-64pay config-interval=1 pt=96 ! udpsink host=192.168.1.9 port=5000 sync=false`
-
-After a lot of debugging, I found that using udpsrc in a larger pipeline will require adding queues to make sure that there are no race conditions. There was a weird issue where adding the -v option to the gstreamer command would slow down the pipeline enough to make it work
-
-`gst-launch-1.0 glvideomixer name=mix background=1 sink_0::xpos=0 sink_0::ypos=0 sink_0::width=1920 sink_0::height=1080 sink_1::xpos=1920 sink_1::ypos=0 sink_1::width=1920 sink_1::height=1080 sink_2::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 sink_3::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! glcolorconvert ! fpsdisplaysink video-sink=glimagesink text-overlay=true sync=true udpsrc port=5101 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! rtpjitterbuffer latency=0 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens0 ! gltransformation name=stab0 ! queue ! mix.sink_0 videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens1 ! gltransformation name=stab1 ! queue ! mix.sink_1 videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens2 ! gltransformation name=stab2 ! queue ! mix.sink_2 videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens3 ! gltransformation name=stab3 ! mix.sink_3`
-
-I might have lied, you may need a jitterbuffer
-
-`gst-launch-1.0 glvideomixer name=mix background=1 sink_0::xpos=0 sink_0::ypos=0 sink_0::width=1920 sink_0::height=1080 sink_1::xpos=1920 sink_1::ypos=0 sink_1::width=1920 sink_1::height=1080 sink_2::xpos=0 sink_2::ypos=1080 sink_2::width=1920 sink_2::height=1080 sink_3::xpos=1920 sink_3::ypos=1080 sink_3::width=1920 sink_3::height=1080 ! glcolorconvert ! fpsdisplaysink video-sink=glimagesink text-overlay=true sync=true udpsrc port=5101 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" ! rtpjitterbuffer latency=10 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens0 ! gltransformation name=stab0 ! queue ! mix.sink_0 videotestsrc pattern=0 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens1 ! gltransformation name=stab1 ! queue ! mix.sink_1 videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens2 ! gltransformation name=stab2 ! queue ! mix.sink_2 videotestsrc pattern=1 ! video/x-raw,width=1920,height=1080,framerate=30/1 ! videorate ! video/x-raw,framerate=60/1 ! glupload ! glshader name=lens3 ! gltransformation name=stab3 ! queue ! mix.sink_3`
-
-Ill figure this shi out later
-## Software Encoding option
-
-RPI (Supposed to be minimal CPU load, still at 50%):
-`gst-launch-1.0   libcamerasrc   ! video/x-raw,width=1920,height=1080,framerate=30/1,format=I420   ! queue max-size-buffers=4 leaky=downstream   ! x264enc       tune=zerolatency       speed-preset=ultrafast       bitrate=6000       key-int-max=30       bframes=0       cabac=false       ref=1       sliced-threads=true       threads=4   ! video/x-h264,profile=baseline   ! rtph264pay pt=96 config-interval=1   ! udpsink host=192.168.1.9 port=5000 sync=false`
-
-PC (With stats overlay):
-`gst-launch-1.0 \
-  udpsrc port=5000 caps="application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000" \
-  ! rtpjitterbuffer latency=0 \
-  ! rtph264depay \
-  ! h264parse \
-  ! avdec_h264 \
-  ! videoconvert \
-  ! fpsdisplaysink video-sink=autovideosink text-overlay=true sync=false`
-
-RPi (with GL pipeline and simple transform):
-``
-Only Ran at 10fps. Next steps:
-- test transform on laptop after decode
-- were raw images running faster? I think those had gl transform
-- Package IMU data in mp4 container?
