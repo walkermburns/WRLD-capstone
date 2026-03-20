@@ -18,9 +18,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(buoy_app main.cpp BNO055.cpp I2CTransport.cpp IMUProtoSender.cpp VideoStreamer.cpp Config.cpp)
+add_executable(buoy_app main.cpp BNO055.cpp I2CTransport.cpp SPITransport.cpp BMI323Driver.cpp IMUProtoSender.cpp VideoStreamer.cpp Config.cpp ../lib/BMI3XY_SensorAPI/bmi3.c ../lib/BMI3XY_SensorAPI/bmi323.c)
 
 target_link_libraries(buoy_app PRIVATE proto_lib)
 
-target_include_directories(buoy_app PRIVATE ${GST_INCLUDE_DIRS})
+target_include_directories(buoy_app PRIVATE ${GST_INCLUDE_DIRS} ../lib/BMI3XY_SensorAPI)
 target_link_libraries(buoy_app PRIVATE ${GST_LIBRARIES} ${GST_RTP_LIBRARIES} yaml-cpp)

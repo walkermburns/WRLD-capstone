@@ -1,5 +1,6 @@
 
 #include "BNO055.h"
+#include "BMI323Driver.h"
 #include <thread>
 #include <atomic>
 #include <queue>
@@ -17,6 +18,7 @@
 #include <pthread.h>
 
 static std::atomic<bool> running{true};
+static bool sensorTestMode = false;
 static std::queue<IMUData> imuQueue;
 static std::mutex queueMutex;
 static std::condition_variable dataCv;
@@ -32,13 +34,19 @@ void sensorLoop(IMUInterface &imu)
     {
         IMUData data = imu.readSensor();
 
+        std::cout << "[sensor] accel (g): " << data.accel.x << ", " << data.accel.y << ", " << data.accel.z << "\n";
+
+        if (!sensorTestMode)
         {
             std::lock_guard<std::mutex> lock(queueMutex);
             imuQueue.push(data);
+            dataCv.notify_one();
+            usleep(10000); // 100 Hz
         }
-        dataCv.notify_one();
-
-        usleep(10000); // 100 Hz
+        else
+        {
+            usleep(100000); // 10 Hz
+        }
     }
     std::cout << "[sensor] exiting\n";
 }
@@ -92,7 +100,9 @@ int main()
               << " videoPort=" << cfg.videoPort << "\n";
 
     // create concrete sensor implementation; defaults match original
-    BNO055Driver imu;
+    // BNO055Driver imu;
+    BMI323Driver imu;
+    sensorTestMode = true; // print accel at 10Hz, do not push to queue while testing
 
     if (!imu.init()) {
         return -1;
@@ -103,10 +113,14 @@ int main()
     std::thread sensorThread(sensorLoop, std::ref(imu));
 
     // create sender instance based on config and give it to the thread
-    // send IMU/video to base station
+    // send IMU/video to base station (disabled for sensor validation)
     IMUProtoSender sender(cfg.baseIp.c_str(), cfg.imuPort);
-    std::cout << "[main] starting sender thread\n";
-    std::thread networkThread(senderLoop, std::ref(sender));
+    std::thread networkThread;
+
+    if (!sensorTestMode) {
+        std::cout << "[main] starting sender thread\n";
+        networkThread = std::thread(senderLoop, std::ref(sender));
+    }
 
     // simultaneously start the video streamer; uses an independent port
     VideoStreamer video(cfg.baseIp, cfg.videoPort);
@@ -128,8 +142,12 @@ int main()
     std::cout << "[main] video stopped\n";
 
     sensorThread.join();
-    networkThread.join();
-    std::cout << "[main] imu & sender threads joined\n";
+    if (!sensorTestMode && networkThread.joinable()) {
+        networkThread.join();
+        std::cout << "[main] imu & sender threads joined\n";
+    } else {
+        std::cout << "[main] imu thread joined (sender disabled in test mode)\n";
+    }
 
     google::protobuf::ShutdownProtobufLibrary();
 }
