@@ -3,6 +3,7 @@
 #include "IMU.h"
 #include "SPITransport.h"
 #include "bmi323.h"
+#include "IMUHelpers.h"
 
 class BMI323Driver : public IMUInterface {
 public:
@@ -21,4 +22,5 @@ private:
     SPITransport transport;
     struct bmi3_dev dev = {};
     IMUData data = {};
+    Quaternion filteredQuat = {0.0f, 0.0f, 0.0f, 0.0f};
 };

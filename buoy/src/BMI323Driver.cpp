@@ -27,16 +27,19 @@ void BMI323Driver::delayCallback(uint32_t period, void *intf_ptr)
 
 float BMI323Driver::convertAccel(int16_t raw)
 {
-    // convert LSB to g
-    constexpr float g_range = 2.0f; // 2G configuration below
-    return (raw * g_range) / (static_cast<float>(1 << (dev.resolution - 1)));
+    constexpr float g_range = 2.0f;
+    uint8_t resolution = dev.resolution ? dev.resolution : 16;
+    float half_scale = static_cast<float>(1u << (resolution - 1));
+    float value_g = (static_cast<float>(raw) * g_range) / half_scale;
+    return value_g * 9.80665f; // m/s^2
 }
 
 float BMI323Driver::convertGyro(int16_t raw)
 {
-    // convert LSB to °/s
     constexpr float dps_range = 2000.0f;
-    return (raw * dps_range) / (static_cast<float>(1 << (dev.resolution - 1)));
+    uint8_t resolution = dev.resolution ? dev.resolution : 16;
+    float half_scale = static_cast<float>(1u << (resolution - 1));
+    return (static_cast<float>(raw) * dps_range) / half_scale;
 }
 
 bool BMI323Driver::init()
@@ -124,10 +127,13 @@ const IMUData &BMI323Driver::readSensor()
     data.gyro.y = convertGyro(sensors[1].sens_data.gyr.y);
     data.gyro.z = convertGyro(sensors[1].sens_data.gyr.z);
 
-    data.quat.w = 1.0f;
-    data.quat.x = 0.0f;
-    data.quat.y = 0.0f;
-    data.quat.z = 0.0f;
+    Vec3 accelG = { data.accel.x, data.accel.y, data.accel.z };
+    // The quaternion helper assumes a normalized gravity vector in unit Gs.
+    accelG.x /= 9.80665f;
+    accelG.y /= 9.80665f;
+    accelG.z /= 9.80665f;
+
+    IMUHelpers::accelToQuatAndFilter(accelG, data.quat, filteredQuat, 0.15f);
 
     return data;
 }
