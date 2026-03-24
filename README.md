@@ -81,3 +81,30 @@ sudo apt-get install -y \
 ```
 - libcamera `sudo apt install libcamera-dev libcamera-tools libcamera-ipa`
 - libyaml-cpp-dev
+
+# How To setup and run
+
+Deploy images to buoy and build (only 1 device supported rn):
+
+`./deploy build`
+
+Pay attention to the errors, if setting up on a new OS image, will need to install all dependencies listed in ramblings.md
+
+ssh into the pi (IP and user listed above) and run `./buoy_app` in `~/buoy/build`
+
+To build the base station, cd into base, make a directory for build, and run the following cmake command:
+
+```
+cd base
+mkdir build && cd build
+cmake ../src
+```
+
+Then run make to build and run the app:
+
+```
+make -j4
+./base_station
+```
+
+ports, ips, etc are all set in the yaml config. For now the default is that you will need an ethernet interface with a static IP of 192.168.1.9 and subnet mask of 255.255.255.0 (or /24) 
