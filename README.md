@@ -53,7 +53,31 @@ Scripts will make or break the usability of Mora. In both development and deplym
 ## Configs
 There are two configuration files that are used for changing the behavior of the software, and this behavior can be altered without recompiling the program.
 
+## Buoy IPs
+
+| Hostname | User | IP Address | Notes | 
+| --- | --- | --- | --- |
+| raspberrypi | walker | 192.168.1.10 | SD Card corrupted? |
+| mola1 | walker | 192.168.1.20 | |
+
+
 # List of Software Dependencies
+- cmake
+- protobuf `sudo apt install protobuf-compiler libprotobuf-dev
+`
 - Gstreamer 1.0
-- libcamera
+``` 
+sudo apt-get install -y \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer1.0-dev \
+    gstreamer1.0-libcamera
+```
+- libcamera `sudo apt install libcamera-dev libcamera-tools libcamera-ipa`
 - libyaml-cpp-dev
