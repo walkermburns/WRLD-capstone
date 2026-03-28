@@ -6,8 +6,79 @@
 #include <iomanip>   // for setw, left
 #include <unordered_map>
 #include <chrono>
+#include <cerrno>
+#include <algorithm>
+#include <cmath>
 
 using namespace MathHelpers; // simplify quaternion/matrix calls
+
+namespace {
+
+// normalize quaternion to unit length; falls back to identity if degenerate
+static Quaternion normalize_quat(const Quaternion &q)
+{
+    float n2 = q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z;
+    if (n2 <= 1e-12f) {
+        return Quaternion{};
+    }
+    float invn = 1.0f / std::sqrt(n2);
+    Quaternion r;
+    r.w = q.w * invn;
+    r.x = q.x * invn;
+    r.y = q.y * invn;
+    r.z = q.z * invn;
+    return r;
+}
+
+// quaternion from rotation vector (axis * angle), where components are radians
+static Quaternion rotvec_to_quat(float rx, float ry, float rz)
+{
+    float angle = std::sqrt(rx*rx + ry*ry + rz*rz);
+    Quaternion q;
+    if (angle < 1e-9f) {
+        q.w = 1.0f;
+        q.x = 0.5f * rx;
+        q.y = 0.5f * ry;
+        q.z = 0.5f * rz;
+        return normalize_quat(q);
+    }
+
+    float half = 0.5f * angle;
+    float s = std::sin(half) / angle;
+    q.w = std::cos(half);
+    q.x = rx * s;
+    q.y = ry * s;
+    q.z = rz * s;
+    return normalize_quat(q);
+}
+
+// convert a small rotation quaternion to rotation-vector form
+static void quat_to_rotvec(const Quaternion &qin, float &rx, float &ry, float &rz)
+{
+    Quaternion q = normalize_quat(qin);
+
+    // choose shortest-path representation
+    if (q.w < 0.0f) {
+        q.w = -q.w;
+        q.x = -q.x;
+        q.y = -q.y;
+        q.z = -q.z;
+    }
+
+    float vnorm = std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z);
+    if (vnorm < 1e-9f) {
+        rx = ry = rz = 0.0f;
+        return;
+    }
+
+    float angle = 2.0f * std::atan2(vnorm, q.w);
+    float scale = angle / vnorm;
+    rx = q.x * scale;
+    ry = q.y * scale;
+    rz = q.z * scale;
+}
+
+} // namespace
 
 // static member definitions
 std::mutex BuoyNode::printMutex;
@@ -60,7 +131,7 @@ bool BuoyNode::start()
     }
 #endif
 
-    // optionally make the socket non‑blocking so that a stray recv can't hang
+    // optionally make the socket non-blocking so that a stray recv can't hang
     // the thread; the shutdown logic already makes recv return with error
     // so this is just defensive.  if non-blocking is used the receiveLoop
     // would need to handle EAGAIN/EWOULDBLOCK (currently it does not).
@@ -129,13 +200,61 @@ void BuoyNode::receiveLoop()
         // compute quaternion and homography together under lock using helper
         {
             std::lock_guard<std::mutex> lock(quatMutex_);
+
+            const uint64_t ts = msg.timestamp();
+
             lastQuat_.w = msg.quat_w();
             lastQuat_.x = msg.quat_x();
             lastQuat_.y = msg.quat_y();
             lastQuat_.z = msg.quat_z();
+            lastQuat_ = normalize_quat(lastQuat_);
+
+            // keep a short quaternion history so we can estimate angular velocity
+            // from the latest two orientation samples and predict slightly ahead
+            // to compensate for display / decode latency.
+            quat_hist_.emplace_back(ts, lastQuat_);
+            while (!quat_hist_.empty() && ts > quat_hist_.front().first + 300000ull) {
+                quat_hist_.pop_front();
+            }
+
+            // update filtered angular velocity using the newest two quaternion samples
+            if (quat_hist_.size() >= 2) {
+                const auto &a = quat_hist_[quat_hist_.size() - 2];
+                const auto &b = quat_hist_[quat_hist_.size() - 1];
+
+                if (b.first > a.first && b.first != last_omega_ts_) {
+                    Quaternion dq = quat_mult(b.second, quat_inverse(a.second));
+
+                    float rvx = 0.0f, rvy = 0.0f, rvz = 0.0f;
+                    quat_to_rotvec(dq, rvx, rvy, rvz);
+
+                    float dt = std::max(1e-6f, float(b.first - a.first) * 1e-6f);
+
+                    float ox = std::clamp(rvx / dt, -omega_clamp_, omega_clamp_);
+                    float oy = std::clamp(rvy / dt, -omega_clamp_, omega_clamp_);
+                    float oz = std::clamp(rvz / dt, -omega_clamp_, omega_clamp_);
+
+                    omega_filt_[0] = (1.0f - omega_alpha_) * omega_filt_[0] + omega_alpha_ * ox;
+                    omega_filt_[1] = (1.0f - omega_alpha_) * omega_filt_[1] + omega_alpha_ * oy;
+                    omega_filt_[2] = (1.0f - omega_alpha_) * omega_filt_[2] + omega_alpha_ * oz;
+
+                    last_omega_ts_ = b.first;
+                }
+            }
+
+            // predict forward a small amount to offset end-to-end latency
+            Quaternion q_pred = lastQuat_;
+            {
+                float dt_pred = std::clamp(predict_lead_s_, 0.0f, predict_max_s_);
+                Quaternion dq_pred = rotvec_to_quat(omega_filt_[0] * dt_pred,
+                                                    omega_filt_[1] * dt_pred,
+                                                    omega_filt_[2] * dt_pred);
+                q_pred = quat_mult(dq_pred, lastQuat_);
+                q_pred = normalize_quat(q_pred);
+            }
 
             float Hinv[9];
-            bool ok = compute_homography_from_quat(lastQuat_, quat_ref, have_ref,
+            bool ok = compute_homography_from_quat(q_pred, quat_ref, have_ref,
                                                    corr_smooth_alpha,
                                                    corr_pitch_filt, corr_roll_filt,
                                                    Rflu2cv_mat, K, Kinv,
@@ -143,13 +262,14 @@ void BuoyNode::receiveLoop()
             if (ok) {
                 for (int i = 0; i < 9; ++i)
                     lastHinv_[i] = Hinv[i];
-                // record timestamped matrix; keep only past ~100ms of samples
-                uint64_t ts = msg.timestamp();
+
+                // record timestamped matrix; keep only past ~300ms of samples
                 hist_.emplace_back(ts, std::array<float,9>{});
                 for (int i = 0; i < 9; ++i)
                     hist_.back().second[i] = Hinv[i];
-                // drop old entries (older than 100000us)
-                while (!hist_.empty() && ts > hist_.front().first + 100000ull) {
+
+                // drop old entries (older than 300000us)
+                while (!hist_.empty() && ts > hist_.front().first + 300000ull) {
                     hist_.pop_front();
                 }
             }
@@ -187,20 +307,45 @@ std::array<float,9> BuoyNode::getHinv() const {
     return out;
 }
 
-bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out) const {
+// bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out) const {
+//     std::lock_guard<std::mutex> lock(quatMutex_);
+//     if (hist_.empty())
+//         return false;
+//     uint64_t bestDiff = UINT64_MAX;
+//     bool found = false;
+//     for (const auto &p : hist_) {
+//         uint64_t diff = (p.first > timestamp) ? p.first - timestamp : timestamp - p.first;
+//         if (diff < bestDiff) {
+//             bestDiff = diff;
+//             out = p.second;
+//             found = true;
+//         }
+//     }
+//     return found;
+// }
+
+bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out,
+                         uint64_t *best_diff_us) const {
     std::lock_guard<std::mutex> lock(quatMutex_);
     if (hist_.empty())
         return false;
+
     uint64_t bestDiff = UINT64_MAX;
     bool found = false;
+
     for (const auto &p : hist_) {
-        uint64_t diff = (p.first > timestamp) ? p.first - timestamp : timestamp - p.first;
+        uint64_t diff = (p.first > timestamp) ? (p.first - timestamp)
+                                              : (timestamp - p.first);
         if (diff < bestDiff) {
             bestDiff = diff;
             out = p.second;
             found = true;
         }
     }
+
+    if (best_diff_us)
+        *best_diff_us = bestDiff;
+
     return found;
 }
 

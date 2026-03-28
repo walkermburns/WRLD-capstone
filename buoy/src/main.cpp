@@ -1,11 +1,13 @@
 
 #include "BNO055.h"
 #include "BMI323Driver.h"
+#include "IMUHelpers.h"
 #include <thread>
 #include <atomic>
 #include <queue>
 #include <mutex>
 #include <chrono>
+#include <fstream>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -21,6 +23,8 @@ static std::atomic<bool> running{true};
 static std::queue<IMUData> imuQueue;
 static std::mutex queueMutex;
 static std::condition_variable dataCv;
+static std::ofstream csvFile;
+static bool enableCsvLogging = true;  // Set to false to disable CSV logging
 
 // =============================
 // Sensor Thread (100 Hz)
@@ -30,16 +34,37 @@ void sensorLoop(IMUInterface &imu)
     pthread_setname_np(pthread_self(), "sensor");
     std::cout << "[sensor] started\n";
     int loopCount = 0;
+    auto startTime = std::chrono::high_resolution_clock::now();
 
     while (running)
     {
         IMUData data = imu.readSensor();
 
+        // Calculate elapsed time in milliseconds
+        auto now = std::chrono::high_resolution_clock::now();
+        auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+
+        // Log to CSV at every sample (100 Hz)
+        if (enableCsvLogging && csvFile.is_open()) {
+            float roll, pitch, yaw;
+            IMUHelpers::quatToEulerZYX(data.quat, roll, pitch, yaw);
+
+            csvFile << elapsedMs << ","
+                    << data.accel.x << "," << data.accel.y << "," << data.accel.z << ","
+                    << data.gyro.x << "," << data.gyro.y << "," << data.gyro.z << ","
+                    << IMUHelpers::radToDeg(roll) << "," << IMUHelpers::radToDeg(pitch) << "," << IMUHelpers::radToDeg(yaw) << ","
+                    << data.quat.w << "," << data.quat.x << "," << data.quat.y << "," << data.quat.z << "\n";
+        }
+
         // 10Hz validation output while operating at 100Hz
         if ((++loopCount % 10) == 0) {
-            std::cout << "[sensor] accel (g): "
+            float roll, pitch, yaw;
+            IMUHelpers::quatToEulerZYX(data.quat, roll, pitch, yaw);
+
+            std::cout << "[sensor] accel (m/s2): "
                       << data.accel.x << ", " << data.accel.y << ", " << data.accel.z
                       << " | gyro (dps): " << data.gyro.x << ", " << data.gyro.y << ", " << data.gyro.z
+                      << " | euler (deg): " << IMUHelpers::radToDeg(roll) << ", " << IMUHelpers::radToDeg(pitch) << ", " << IMUHelpers::radToDeg(yaw)
                       << " | quat: " << data.quat.w << ", " << data.quat.x << ", " << data.quat.y << ", " << data.quat.z
                       << "\n";
         }
@@ -48,7 +73,7 @@ void sensorLoop(IMUInterface &imu)
             std::lock_guard<std::mutex> lock(queueMutex);
             imuQueue.push(data);
         }
-        dataCv.notify_one();
+        dataCv.notify_all();
 
         usleep(10000); // 100 Hz
     }
@@ -112,6 +137,18 @@ int main()
         return -1;
     }
 
+    // Open CSV log file if enabled
+    if (enableCsvLogging) {
+        csvFile.open("imu_log.csv");
+        if (csvFile.is_open()) {
+            csvFile << "time_ms,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z,roll_deg,pitch_deg,yaw_deg,quat_w,quat_x,quat_y,quat_z\n";
+            csvFile.flush();
+            std::cout << "[main] CSV logging to imu_log.csv\n";
+        } else {
+            std::cerr << "[main] failed to open imu_log.csv for writing\n";
+        }
+    }
+
     // pass by reference to avoid slicing
     std::cout << "[main] starting sensor thread\n";
     std::thread sensorThread(sensorLoop, std::ref(imu));
@@ -135,7 +172,15 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // shutdown video immediately; other threads may still be finishing
+    // Notify all waiting threads to wake up and exit
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+    }
+    dataCv.notify_all();
+
+    // Give threads a brief moment to process
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
     video.stop();
     std::cout << "[main] video stopped\n";
 
@@ -144,6 +189,12 @@ int main()
         networkThread.join();
     }
     std::cout << "[main] imu & sender threads joined\n";
+
+    // Close CSV file
+    if (csvFile.is_open()) {
+        csvFile.close();
+        std::cout << "[main] CSV log closed\n";
+    }
 
     google::protobuf::ShutdownProtobufLibrary();
 }
