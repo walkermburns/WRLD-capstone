@@ -135,3 +135,26 @@ Only Ran at 10fps. Next steps:
 - test transform on laptop after decode
 - were raw images running faster? I think those had gl transform
 - Package IMU data in mp4 container?
+
+# Testing Hardware
+
+## Fixing Swapped camera I2C busses
+
+The I2C busses are flipped between the cameras. When I plug a cmaera into port 0:
+![alt text](images/cami2cbus.png)
+
+Cam 0 should be connected to bus 0, so I need to swap the busses (preferrably in software). The commands I used for this btw:
+`sudo dtparam i2c_vc=on` to make the cameras busses visible, `i2cdetect -y 0` to scan devices on the bus.
+
+I was able to swap the i2c busses in software and after fixing a solder bridge on one of the ffc connectors, the camera was detected and communicating.
+
+I had to add these lines to the boot config file:
+
+```
+camera_auto_detect = 0 # Change this line from 1
+
+# in the [all] section:
+dtoverlay=cm-swap-i2c0,i2c10-gpio0,i2c0-gpio44
+dtoverlay=IMX708,cam0
+dtoverlay=IMX708,cam1
+```

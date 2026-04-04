@@ -61,6 +61,18 @@ def worker(target, show_all, run_after, results, lock):
         ])
         if rsync.returncode != 0:
             raise RuntimeError(rsync.stderr)
+        
+        print(prefix + "source synced")
+
+        # 3️⃣ Sync lib
+        rsync_lib = run_cmd([
+            "rsync", "-az", "--delete",
+            f"{BUOY_DIR}/lib/",
+            f"{host}:{path}/lib/"
+        ])
+        if rsync_lib.returncode != 0:
+            raise RuntimeError(rsync_lib.stderr)
+
 
         # 4️⃣ Configure
         configure = run_cmd([

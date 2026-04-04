@@ -59,7 +59,7 @@ static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer /*user_data*/)
 // so we no longer define them here.  VideoComposite.cpp simply includes the
 // header and uses the free functions via namespace MathHelpers.
 
-// probe that reads one‑byte RFC5285 extension id=1 carrying 64-bit microsecond
+// probe that reads one-byte RFC5285 extension id=1 carrying 64-bit microsecond
 // timestamp and prints it alongside sequence number.
 static GstPadProbeReturn rtp_timestamp_probe(GstPad *pad, GstPadProbeInfo *info,
                                              gpointer /*user_data*/)
@@ -108,6 +108,14 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
     num_src = static_cast<int>(video_ports.size());
     stab.assign(num_src, nullptr);
     branch_active.assign(num_src, false);
+
+    // initialize compositor-side matrix smoothing state to identity so the
+    // first applied homography blends in from a well-defined baseline.
+    last_applied_hinv_.assign(num_src, std::array<float,9>{});
+    for (int i = 0; i < num_src; ++i) {
+        for (int j = 0; j < 9; ++j)
+            last_applied_hinv_[i][j] = (j % 4 == 0) ? 1.0f : 0.0f;
+    }
 
     // (camera matrix initialization is now handled inside BuoyNode; not
     // needed here)
@@ -291,14 +299,28 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
 
     for (int i = 0; i < self->num_src; ++i) {
         int idx = (forceIndex >= 0) ? forceIndex : i;
+
+        // pull the latest homography from the corresponding IMU node
+        std::array<float,9> target;
         if (self->nodes_ && idx < (int)self->nodes_->size()) {
             auto mat = (*self->nodes_)[idx]->getHinv();
             for (int j = 0; j < 9; ++j)
-                hinvs[i][j] = mat[j];
+                target[j] = mat[j];
         } else {
             for (int j = 0; j < 9; ++j)
-                hinvs[i][j] = (j % 4 == 0) ? 1.0f : 0.0f;
+                target[j] = (j % 4 == 0) ? 1.0f : 0.0f;
         }
+
+        // compositor-side smoothing: low-pass the final Hinv sent to the shader.
+        // this is intentionally separate from the IMU-side corr_smooth_alpha,
+        // which smooths roll/pitch before the homography is built.
+        std::array<float,9> filt = self->last_applied_hinv_[i];
+        for (int j = 0; j < 9; ++j) {
+            filt[j] += self->shader_hinv_alpha_ * (target[j] - filt[j]);
+        }
+
+        self->last_applied_hinv_[i] = filt;
+        hinvs[i] = filt;
     }
 
     // set the uniforms (keep k1/zoom constant for now)
@@ -376,8 +398,8 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     GstElement *mix = gst_element_factory_make("glvideomixer", "mix");
     GstElement *convert = gst_element_factory_make("glcolorconvert", "conv");
     GstElement *fps = gst_element_factory_make("fpsdisplaysink", "fps");
-    GstElement *videosink = gst_element_factory_make("autovideosink", "vsink");
-
+    // GstElement *videosink = gst_element_factory_make("autovideosink", "vsink");
+    GstElement *videosink = gst_element_factory_make("glimagesink", "vsink");
     if (!mix || !convert || !fps || !videosink) {
         g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
@@ -390,9 +412,12 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
                  "sync", TRUE,
                  NULL);
 
-    /* add all elements to pipeline (videosink must be owned to avoid premature
-       free when fpsdisplaysink grabs it) */
-    gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, videosink, NULL);
+    /* add all elements to pipeline except videosink (fpsdisplaysink owns it) */
+    
+    // NOTE: we used to add videosink here and link it to fps, but chat said to not so...
+    // gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, videosink, NULL);
+
+    gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, NULL);
     if (!gst_element_link_many(mix, convert, fps, NULL)) {
         g_printerr("run_pipeline: failed to link core elements\n");
         return NULL;
@@ -402,7 +427,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     /* we'll use mix pointer below when attaching branches */
 
     /* dynamic configuration for mixer sinks; change values or number here
-       we want a 2x2 grid for the UDP sources and a full‑screen background test
+       we want a 2x2 grid for the UDP sources and a full-screen background test
        pattern.  The background element is created separately below. */
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;

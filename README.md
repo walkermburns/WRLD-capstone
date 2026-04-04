@@ -53,7 +53,58 @@ Scripts will make or break the usability of Mora. In both development and deplym
 ## Configs
 There are two configuration files that are used for changing the behavior of the software, and this behavior can be altered without recompiling the program.
 
+## Buoy IPs
+
+| Hostname | User | IP Address | Notes | 
+| --- | --- | --- | --- |
+| raspberrypi | walker | 192.168.1.10 | SD Card corrupted? |
+| mola1 | walker | 192.168.1.20 | |
+
+
 # List of Software Dependencies
+- cmake
+- protobuf `sudo apt install protobuf-compiler libprotobuf-dev
+`
 - Gstreamer 1.0
-- libcamera
+``` 
+sudo apt-get install -y \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    libgstreamer1.0-dev \
+    gstreamer1.0-libcamera
+```
+- libcamera `sudo apt install libcamera-dev libcamera-tools libcamera-ipa`
 - libyaml-cpp-dev
+
+# How To setup and run
+
+Deploy images to buoy and build (only 1 device supported rn):
+
+`./deploy build`
+
+Pay attention to the errors, if setting up on a new OS image, will need to install all dependencies listed in ramblings.md
+
+ssh into the pi (IP and user listed above) and run `./buoy_app` in `~/buoy/build`
+
+To build the base station, cd into base, make a directory for build, and run the following cmake command:
+
+```
+cd base
+mkdir build && cd build
+cmake ../src
+```
+
+Then run make to build and run the app:
+
+```
+make -j4
+./base_station
+```
+
+ports, ips, etc are all set in the yaml config. For now the default is that you will need an ethernet interface with a static IP of 192.168.1.9 and subnet mask of 255.255.255.0 (or /24) 
