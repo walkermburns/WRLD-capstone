@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import os
 import shutil
+import tempfile
 
 CWD = Path.cwd() # Current Working Directory
 BUOY_DIR = CWD / "buoy"
@@ -29,7 +30,27 @@ def ping_host(host, count):
     ]).returncode == 0
 
 
-def worker(target, show_all, run_after, results, lock):
+def write_remote_target_config(host, path, target, global_config):
+    config_data = {}
+    if global_config:
+        config_data["global"] = global_config
+    config_data["targets"] = [target]
+
+    with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as tmp_file:
+        yaml.safe_dump(config_data, tmp_file, sort_keys=False)
+        tmp_path = Path(tmp_file.name)
+
+    try:
+        rsync = run_cmd([
+            "rsync", "-az", f"{tmp_path}", f"{host}:{path}/src/configs/targets.yaml"
+        ])
+        if rsync.returncode != 0:
+            raise RuntimeError(rsync.stderr)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def worker(target, show_all, run_after, global_config, results, lock):
     name = target["name"]
     host = target["host"]
     path = target["path"]
@@ -61,8 +82,23 @@ def worker(target, show_all, run_after, results, lock):
         ])
         if rsync.returncode != 0:
             raise RuntimeError(rsync.stderr)
+        
+        print(prefix + "source synced")
 
-        # 4️⃣ Configure
+        # 3️⃣ Sync lib
+        rsync_lib = run_cmd([
+            "rsync", "-az", "--delete",
+            f"{BUOY_DIR}/lib/",
+            f"{host}:{path}/lib/"
+        ])
+        if rsync_lib.returncode != 0:
+            raise RuntimeError(rsync_lib.stderr)
+
+        # 4️⃣ Write per-target config on remote device
+        write_remote_target_config(host, path, target, global_config)
+        print(prefix + "target config written")
+
+        # 5️⃣ Configure
         configure = run_cmd([
             "ssh", host,
             f"cd {path}/build && cmake ../src"
@@ -126,7 +162,10 @@ def main():
     args = parser.parse_args()
 
     with open("targets.yaml") as f:
-        targets = yaml.safe_load(f)["targets"]
+        config = yaml.safe_load(f)
+
+    targets = config["targets"]
+    global_config = config.get("global", {})
 
     # Setup dirs before copy
     # Copy config and proto
@@ -136,8 +175,8 @@ def main():
         print(f"Created: {destination_dir}")
     print(CWD)
     shutil.copy2((CWD / "buoy.proto"), (SRC_DIR / "configs/buoy.proto") )
-    # TODO: This will need to be customized for each target, removing the other targets.
-    shutil.copy2((CWD / "targets.yaml"), (SRC_DIR / "configs/targets.yaml") )
+    # # TODO: This will need to be customized for each target, removing the other targets.
+    # shutil.copy2((CWD / "targets.yaml"), (SRC_DIR / "configs/targets.yaml") )
 
     threads = []
     results = []
@@ -146,7 +185,7 @@ def main():
     for t in targets:
         thread = threading.Thread(
             target=worker,
-            args=(t, args.all, args.command == "run", results, lock)
+            args=(t, args.all, args.command == "run", global_config, results, lock)
         )
         thread.start()
         threads.append(thread)

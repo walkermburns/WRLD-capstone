@@ -4,18 +4,24 @@ global:
 
 
 targets:
-  - name: pi1
-    host: walker@192.168.1.10
-    LAN_IP: 192.168.1.10
+  # - name: pi1
+  #   host: walker@raspberrypi
+  #   LAN_IP: 192.168.1.10
+  #   path: "~/buoy/"
+  #   video_port: 5101
+  #   imu_port: 5001
+  - name: mola1
+    host: walker@192.168.1.20
+    LAN_IP: 192.168.1.20
     path: "~/buoy/"
     video_port: 5101
     imu_port: 5001
-  # - name: pi2
-  #   host: walker@192.168.1.11
-  #   LAN_IP: 192.168.1.11
-  #   path: "~/buoy/"
-  #   video_port: 5102
-  #   imu_port: 5002
+  - name: mola2
+    host: walker@192.168.1.21
+    LAN_IP: 192.168.1.21
+    path: "~/buoy/"
+    video_port: 5102
+    imu_port: 5002
 
 # Camera parameters – resolution, framerate, bitrate, encoder type.
 # IMU settings – sample rate, filter coefficients, calibration file

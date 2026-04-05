@@ -8,6 +8,7 @@
 #include <array>
 #include "buoy.pb.h"
 #include "MathHelpers.h"  // for Quaternion used in getter/storage
+#include <deque>
 
 // A receiver object that binds a UDP socket to the given port and listens for
 // incoming IMU protobuf messages from a single buoy node.  Each instance owns
@@ -60,8 +61,9 @@ public:
     // contain the nearest matrix.  timestamps and history are maintained in
     // microseconds.  The lookup does a linear scan of the stored window
     // (bounded to ~100ms worth of data) which is small enough for 100Hz.
-    bool getHinvAt(uint64_t timestamp, std::array<float,9> &out) const;
-
+    // bool getHinvAt(uint64_t timestamp, std::array<float,9> &out) const;
+    bool getHinvAt(uint64_t timestamp, std::array<float,9> &out,
+               uint64_t *best_diff_us = nullptr) const;
 private:
     // mutex used by printMessage
     static std::mutex printMutex;
@@ -106,4 +108,17 @@ private:
 
     // helper to initialize camera matrices; called from constructors
     void initCameraMatrices();
+
+    // recent quaternion history for latency compensation / prediction
+    std::deque<std::pair<uint64_t, MathHelpers::Quaternion>> quat_hist_;
+
+    // filtered angular velocity predictor state (rotvec rad/s)
+    std::array<float,3> omega_filt_ = {0.0f, 0.0f, 0.0f};
+    uint64_t last_omega_ts_ = 0;
+
+    // prediction tuning
+    float predict_lead_s_ = 0.01f;      // 10 ms lead
+    float predict_max_s_  = 0.30f;      // clamp same spirit as python
+    float omega_alpha_    = 0.10f;       // matches python prototype
+    float omega_clamp_    = 2.0f;       // rad/s clamp
 };

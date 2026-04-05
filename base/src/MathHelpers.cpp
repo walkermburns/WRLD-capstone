@@ -144,16 +144,14 @@ bool compute_homography_from_quat(const Quaternion &quat_cur,
                                   float cam_w,
                                   float cam_h,
                                   float outHinv[9]) {
+    // keep these for compatibility, but they are no longer used for horizon lock
     if (!have_ref) {
         quat_ref = quat_cur;
         have_ref = true;
-        return false;
     }
 
-    Quaternion q_ref_inv = quat_inverse(quat_ref);
-    Quaternion q_rel = quat_mult(quat_cur, q_ref_inv);
     float yaw, pitch, roll;
-    ypr_from_quat(q_rel, yaw, pitch, roll);
+    ypr_from_quat(quat_cur, yaw, pitch, roll);
 
     const float GAIN = 1.0f;
     const float MAX_TILT_RAD = static_cast<float>(35.0 * M_PI / 180.0);
