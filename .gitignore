@@ -4,3 +4,5 @@ buoy/src/configs
 /build
 .venv
 vid_stab/cpp/build/
+
+camera_calib/build/
