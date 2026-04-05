@@ -24,7 +24,7 @@ static std::queue<IMUData> imuQueue;
 static std::mutex queueMutex;
 static std::condition_variable dataCv;
 static std::ofstream csvFile;
-static bool enableCsvLogging = true;  // Set to false to disable CSV logging
+static bool enableCsvLogging = false;  // Set to false to disable CSV logging
 
 // =============================
 // Sensor Thread (100 Hz)
