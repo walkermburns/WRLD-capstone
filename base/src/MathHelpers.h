@@ -13,6 +13,16 @@ struct Quaternion {
     float z{0.0f};
 };
 
+struct StabilizationDebug {
+    float yaw = 0.0f;
+    float pitch = 0.0f;
+    float roll = 0.0f;
+    float pitch_cmd = 0.0f;
+    float roll_cmd = 0.0f;
+    float pitch_filt = 0.0f;
+    float roll_filt = 0.0f;
+};
+
 Quaternion quat_inverse(const Quaternion &q);
 Quaternion quat_mult(const Quaternion &a, const Quaternion &b);
 
@@ -53,7 +63,8 @@ bool compute_homography_from_quat(const Quaternion &quat_cur,
                                   const float Kinv[9],
                                   float cam_w,
                                   float cam_h,
-                                  float outHinv[9]);
+                                  float outHinv[9],
+                                  StabilizationDebug *debug = nullptr);
 
 } // namespace MathHelpers
 

@@ -3,6 +3,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <iostream>
+#include <fstream>
 #include <iomanip>   // for setw, left
 #include <unordered_map>
 #include <chrono>
@@ -80,6 +81,11 @@ static void quat_to_rotvec(const Quaternion &qin, float &rx, float &ry, float &r
 
 } // namespace
 
+static float rad_to_deg(float radians)
+{
+    return radians * 180.0f / static_cast<float>(M_PI);
+}
+
 // static member definitions
 std::mutex BuoyNode::printMutex;
 
@@ -88,6 +94,7 @@ BuoyNode::BuoyNode(std::string name, int imuPort, Callback cb)
       running_(false), lastQuat_()
 {
     initCameraMatrices();
+    initDebugCsv();
 }
 
 BuoyNode::BuoyNode(std::string name, int imuPort)
@@ -152,6 +159,24 @@ bool BuoyNode::start()
     running_ = true;
     thread_ = std::thread(&BuoyNode::receiveLoop, this);
     return true;
+}
+
+void BuoyNode::initDebugCsv()
+{
+    const char *path = getenv("IMU_STAB_CSV");
+    if (!path || path[0] == '\0')
+        return;
+
+    debugCsvFile_.open(path, std::ios::out | std::ios::trunc);
+    if (!debugCsvFile_.is_open()) {
+        std::cerr << "[" << name_ << "] failed to open IMU stabilization CSV '" << path << "'\n";
+        return;
+    }
+
+    debugCsvEnabled_ = true;
+    debugCsvFile_ << "timestamp_us,yaw_deg,pitch_deg,roll_deg,pitch_cmd_deg,roll_cmd_deg,corr_pitch_filt_deg,corr_roll_filt_deg,ok\n";
+    debugCsvFile_.flush();
+    std::cerr << "[" << name_ << "] IMU stabilization CSV logging to " << path << "\n";
 }
 
 void BuoyNode::stop()
@@ -254,11 +279,25 @@ void BuoyNode::receiveLoop()
             }
 
             float Hinv[9];
+            StabilizationDebug debug;
             bool ok = compute_homography_from_quat(q_pred, quat_ref, have_ref,
                                                    corr_smooth_alpha,
                                                    corr_pitch_filt, corr_roll_filt,
                                                    Rflu2cv_mat, K, Kinv,
-                                                   cam_w, cam_h, Hinv);
+                                                   cam_w, cam_h, Hinv,
+                                                   &debug);
+            if (debugCsvEnabled_) {
+                debugCsvFile_ << ts << ","
+                              << rad_to_deg(debug.yaw) << ","
+                              << rad_to_deg(debug.pitch) << ","
+                              << rad_to_deg(debug.roll) << ","
+                              << rad_to_deg(debug.pitch_cmd) << ","
+                              << rad_to_deg(debug.roll_cmd) << ","
+                              << rad_to_deg(debug.pitch_filt) << ","
+                              << rad_to_deg(debug.roll_filt) << ","
+                              << (ok ? 1 : 0) << "\n";
+                debugCsvFile_.flush();
+            }
             if (ok) {
                 for (int i = 0; i < 9; ++i)
                     lastHinv_[i] = Hinv[i];

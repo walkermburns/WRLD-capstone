@@ -143,7 +143,8 @@ bool compute_homography_from_quat(const Quaternion &quat_cur,
                                   const float Kinv[9],
                                   float cam_w,
                                   float cam_h,
-                                  float outHinv[9]) {
+                                  float outHinv[9],
+                                  StabilizationDebug *debug /* = nullptr */) {
     // keep these for compatibility, but they are no longer used for horizon lock
     if (!have_ref) {
         quat_ref = quat_cur;
@@ -154,9 +155,17 @@ bool compute_homography_from_quat(const Quaternion &quat_cur,
     ypr_from_quat(quat_cur, yaw, pitch, roll);
 
     const float GAIN = 1.0f;
-    const float MAX_TILT_RAD = static_cast<float>(35.0 * M_PI / 180.0);
+    const float MAX_TILT_RAD = static_cast<float>(360 * M_PI / 180.0);
     float pitch_c = std::clamp(-GAIN * pitch, -MAX_TILT_RAD, MAX_TILT_RAD);
     float roll_c  = std::clamp(-GAIN * roll,  -MAX_TILT_RAD, MAX_TILT_RAD);
+
+    if (debug) {
+        debug->yaw = yaw;
+        debug->pitch = pitch;
+        debug->roll = roll;
+        debug->pitch_cmd = pitch_c;
+        debug->roll_cmd = roll_c;
+    }
 
     if (corr_alpha < 1.0f) {
         corr_pitch_filt += corr_alpha * (pitch_c - corr_pitch_filt);
@@ -166,6 +175,11 @@ bool compute_homography_from_quat(const Quaternion &quat_cur,
     } else {
         corr_pitch_filt = pitch_c;
         corr_roll_filt  = roll_c;
+    }
+
+    if (debug) {
+        debug->pitch_filt = pitch_c;
+        debug->roll_filt = roll_c;
     }
 
     float cp = cosf(pitch_c);

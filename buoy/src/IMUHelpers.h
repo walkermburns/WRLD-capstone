@@ -33,8 +33,8 @@ inline void rotateIMUAxes(Vec3 &v)
     float ox = v.x;
     float oy = v.y;
     float oz = v.z;
-    v.x = oy;
-    v.y = oz;
+    v.x = -oy;
+    v.y = -oz;
     v.z = ox;
 }
 

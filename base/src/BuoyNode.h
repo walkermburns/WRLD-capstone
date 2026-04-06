@@ -6,9 +6,10 @@
 #include <atomic>
 #include <mutex>
 #include <array>
+#include <deque>
+#include <fstream>
 #include "buoy.pb.h"
 #include "MathHelpers.h"  // for Quaternion used in getter/storage
-#include <deque>
 
 // A receiver object that binds a UDP socket to the given port and listens for
 // incoming IMU protobuf messages from a single buoy node.  Each instance owns
@@ -108,17 +109,22 @@ private:
 
     // helper to initialize camera matrices; called from constructors
     void initCameraMatrices();
+    void initDebugCsv();
 
     // recent quaternion history for latency compensation / prediction
     std::deque<std::pair<uint64_t, MathHelpers::Quaternion>> quat_hist_;
 
     // filtered angular velocity predictor state (rotvec rad/s)
     std::array<float,3> omega_filt_ = {0.0f, 0.0f, 0.0f};
+
+    // optional debug CSV logging for stabilization values
+    std::ofstream debugCsvFile_;
+    bool debugCsvEnabled_ = false;
     uint64_t last_omega_ts_ = 0;
 
     // prediction tuning
-    float predict_lead_s_ = 0.01f;      // 10 ms lead
+    float predict_lead_s_ = 0.010f;      // 10 ms lead
     float predict_max_s_  = 0.30f;      // clamp same spirit as python
-    float omega_alpha_    = 0.10f;       // matches python prototype
+    float omega_alpha_    = 0.1f;       // matches python prototype
     float omega_clamp_    = 2.0f;       // rad/s clamp
 };
