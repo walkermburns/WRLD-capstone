@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 using namespace MathHelpers; // simplify quaternion/matrix calls
 
@@ -94,7 +95,8 @@ BuoyNode::BuoyNode(std::string name, int imuPort, Callback cb)
       running_(false), lastQuat_()
 {
     initCameraMatrices();
-    initDebugCsv();
+    initAnchor();
+    initDebug();
 }
 
 BuoyNode::BuoyNode(std::string name, int imuPort)
@@ -161,7 +163,23 @@ bool BuoyNode::start()
     return true;
 }
 
-void BuoyNode::initDebugCsv()
+void BuoyNode::initAnchor()
+{
+    // default to image center unless env variables override it
+    anchor_x_ = 0.5f * cam_w;
+    anchor_y_ = 0.5f * cam_h;
+
+    const char *ax = getenv("IMU_STAB_ANCHOR_X");
+    const char *ay = getenv("IMU_STAB_ANCHOR_Y");
+    if (ax && *ax) {
+        anchor_x_ = std::strtof(ax, nullptr);
+    }
+    if (ay && *ay) {
+        anchor_y_ = std::strtof(ay, nullptr);
+    }
+}
+
+void BuoyNode::initDebug()
 {
     const char *path = getenv("IMU_STAB_CSV");
     if (!path || path[0] == '\0')
@@ -174,7 +192,7 @@ void BuoyNode::initDebugCsv()
     }
 
     debugCsvEnabled_ = true;
-    debugCsvFile_ << "timestamp_us,yaw_deg,pitch_deg,roll_deg,pitch_cmd_deg,roll_cmd_deg,corr_pitch_filt_deg,corr_roll_filt_deg,ok\n";
+    debugCsvFile_ << "timestamp_us,yaw_deg,pitch_deg,roll_deg,pitch_cmd_deg,roll_cmd_deg,corr_pitch_filt_deg,corr_roll_filt_deg,anchor_x,anchor_y,ok\n";
     debugCsvFile_.flush();
     std::cerr << "[" << name_ << "] IMU stabilization CSV logging to " << path << "\n";
 }
@@ -286,6 +304,12 @@ void BuoyNode::receiveLoop()
                                                    Rflu2cv_mat, K, Kinv,
                                                    cam_w, cam_h, Hinv,
                                                    &debug);
+            if (ok && (anchor_x_ != 0.0f || anchor_y_ != 0.0f)) {
+                float anchoredHinv[9];
+                anchor_homography(Hinv, anchor_x_, anchor_y_, anchoredHinv);
+                for (int i = 0; i < 9; ++i)
+                    Hinv[i] = anchoredHinv[i];
+            }
             if (debugCsvEnabled_) {
                 debugCsvFile_ << ts << ","
                               << rad_to_deg(debug.yaw) << ","
@@ -295,6 +319,8 @@ void BuoyNode::receiveLoop()
                               << rad_to_deg(debug.roll_cmd) << ","
                               << rad_to_deg(debug.pitch_filt) << ","
                               << rad_to_deg(debug.roll_filt) << ","
+                              << anchor_x_ << ","
+                              << anchor_y_ << ","
                               << (ok ? 1 : 0) << "\n";
                 debugCsvFile_.flush();
             }

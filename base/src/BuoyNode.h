@@ -109,7 +109,8 @@ private:
 
     // helper to initialize camera matrices; called from constructors
     void initCameraMatrices();
-    void initDebugCsv();
+    void initDebug();
+    void initAnchor();
 
     // recent quaternion history for latency compensation / prediction
     std::deque<std::pair<uint64_t, MathHelpers::Quaternion>> quat_hist_;
@@ -120,6 +121,8 @@ private:
     // optional debug CSV logging for stabilization values
     std::ofstream debugCsvFile_;
     bool debugCsvEnabled_ = false;
+    float anchor_x_ = 0.0f;
+    float anchor_y_ = 0.0f;
     uint64_t last_omega_ts_ = 0;
 
     // prediction tuning

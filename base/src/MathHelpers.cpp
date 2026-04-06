@@ -93,6 +93,25 @@ bool invert3x3(const float m[9], float out[9])
     return true;
 }
 
+void anchor_homography(const float Hinv[9], float anchor_x, float anchor_y,
+                       float outHinv[9]) {
+    float w = Hinv[6] * anchor_x + Hinv[7] * anchor_y + Hinv[8];
+    float qx = (Hinv[0] * anchor_x + Hinv[1] * anchor_y + Hinv[2]) / w;
+    float qy = (Hinv[3] * anchor_x + Hinv[4] * anchor_y + Hinv[5]) / w;
+    float tx = anchor_x - qx;
+    float ty = anchor_y - qy;
+
+    outHinv[0] = Hinv[0];
+    outHinv[1] = Hinv[1];
+    outHinv[2] = Hinv[2] + tx * Hinv[8];
+    outHinv[3] = Hinv[3];
+    outHinv[4] = Hinv[4];
+    outHinv[5] = Hinv[5] + ty * Hinv[8];
+    outHinv[6] = Hinv[6];
+    outHinv[7] = Hinv[7];
+    outHinv[8] = Hinv[8];
+}
+
 bool homography_is_safe(const float Hinv[9], float w, float h)
 {
     float xs[3] = {0.0f, (w - 1.0f) * 0.5f, w - 1.0f};

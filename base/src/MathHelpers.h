@@ -35,6 +35,11 @@ void mult3x3(const float a[9], const float b[9], float out[9]);
 void transpose3x3(const float a[9], float out[9]);
 bool invert3x3(const float m[9], float out[9]);
 
+// apply a translation in output space after an inverse homography so an
+// anchor pixel remains fixed in screen coordinates.
+void anchor_homography(const float Hinv[9], float anchor_x, float anchor_y,
+                       float outHinv[9]);
+
 // validity check for inverse homography matrix (same logic as gst_warp_imu.py)
 bool homography_is_safe(const float Hinv[9], float w, float h);
 
