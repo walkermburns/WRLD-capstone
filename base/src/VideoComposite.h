@@ -43,6 +43,29 @@ public:
     void updateQuaternion(const buoy_proto::IMU_proto &msg);
 
 private:
+    struct SinkLayout {
+        gint xpos;
+        gint ypos;
+        gint width;
+        gint height;
+    };
+
+    struct PipelineElements {
+        GstElement *mix = nullptr;
+        GstElement *convert = nullptr;
+        GstElement *tee = nullptr;
+        GstElement *display_queue = nullptr;
+        GstElement *fps = nullptr;
+        GstElement *videosink = nullptr;
+        GstElement *record_queue = nullptr;
+        GstElement *download = nullptr;
+        GstElement *record_convert = nullptr;
+        GstElement *record_enc = nullptr;
+        GstElement *record_parse = nullptr;
+        GstElement *record_mux = nullptr;
+        GstElement *record_sink = nullptr;
+    };
+
     GstElement *pipeline;
     GstElement *mix_element;        // cached mixer for callbacks
     std::vector<GstElement*> stab;   // stabilization elements, one per source
@@ -113,6 +136,18 @@ private:
                      float h00 = 1.0f, float h01 = 0.0f, float h02 = 0.0f,
                      float h10 = 0.0f, float h11 = 1.0f, float h12 = 0.0f,
                      float h20 = 0.0f, float h21 = 0.0f, float h22 = 1.0f);
+
+    bool buildStage1And2OutputBranches(PipelineElements &elems);
+    bool buildStage3LayoutAndProbe(GstElement *mix,
+                                   std::vector<SinkLayout> &layouts,
+                                   gint &bg_width,
+                                   gint &bg_height);
+    bool buildStage4BackgroundBranch(GstElement *mix,
+                                     gint bg_width,
+                                     gint bg_height);
+    bool buildStage5UdpSourceBranches(GstElement *mix,
+                                      const std::vector<SinkLayout> &layouts);
+    void buildStage6ConfigureShadersAndStabCache();
 
 };
 

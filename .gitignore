@@ -6,3 +6,4 @@ buoy/src/configs
 vid_stab/cpp/build/
 
 camera_calib/build/
+*.DS_Store
