@@ -228,11 +228,28 @@ void BuoyNode::receiveLoop()
 
             const uint64_t ts = msg.timestamp();
 
-            lastQuat_.w = msg.quat_w();
-            lastQuat_.x = msg.quat_x();
-            lastQuat_.y = msg.quat_y();
-            lastQuat_.z = msg.quat_z();
-            lastQuat_ = normalize_quat(lastQuat_);
+            Quaternion q_new;
+            q_new.w = msg.quat_w();
+            q_new.x = msg.quat_x();
+            q_new.y = msg.quat_y();
+            q_new.z = msg.quat_z();
+            q_new = normalize_quat(q_new);
+
+            // enforce sign continuity: q and -q represent the same
+            // orientation, but discontinuous flips destabilize interpolation
+            // and prediction.
+            if (!quat_hist_.empty()) {
+                const Quaternion &q_prev = quat_hist_.back().second;
+                float dot = q_prev.w*q_new.w + q_prev.x*q_new.x + q_prev.y*q_new.y + q_prev.z*q_new.z;
+                if (dot < 0.0f) {
+                    q_new.w = -q_new.w;
+                    q_new.x = -q_new.x;
+                    q_new.y = -q_new.y;
+                    q_new.z = -q_new.z;
+                }
+            }
+
+            lastQuat_ = q_new;
 
             // keep a short quaternion history so we can estimate angular velocity
             // from the latest two orientation samples and predict slightly ahead

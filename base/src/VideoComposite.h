@@ -79,12 +79,11 @@ private:
     float live_h10, live_h11, live_h12;
     float live_h20, live_h21, live_h22;
 
-    // compositor-side smoothing state -------------------------------------------
-    // the IMU node already computes an Hinv matrix from each quaternion.  here
-    // we optionally smooth the final matrix sent to the shader to reduce visible
-    // frame-to-frame shimmer without changing the upstream horizon-lock math.
-    std::vector<std::array<float,9>> last_applied_hinv_;
-    float shader_hinv_alpha_ = 0.15f; // 0<alpha<=1, smaller = smoother
+    // per-branch latest sender timestamp (microseconds) extracted from RTP
+    // extension headers.  Written by RTP pad probes and read by shader probes.
+    std::mutex frameTsMutex_;
+    std::vector<uint64_t> latest_frame_ts_us_;
+    std::vector<bool> latest_frame_ts_valid_;
 
     // quaternion/matrix helper functions are defined in MathHelpers
     // (no need to redeclare here).  implementations live in MathHelpers.{h,cpp}
@@ -94,6 +93,9 @@ private:
                                    gpointer user_data);
     static GstPadProbeReturn imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                           gpointer user_data);
+    static GstPadProbeReturn rtp_timestamp_probe_cb(GstPad *pad,
+                                                    GstPadProbeInfo *info,
+                                                    gpointer user_data);
 
     // helper used by macOS entry point
     static void *run_pipeline(gpointer user_data);
