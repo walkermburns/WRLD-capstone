@@ -66,58 +66,7 @@ static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer /*user_data*/)
 // so we no longer define them here.  VideoComposite.cpp simply includes the
 // header and uses the free functions via namespace MathHelpers.
 
-// probe that reads one-byte RFC5285 extension id=1 carrying 64-bit microsecond
-// timestamp and stores it for the corresponding branch.
-GstPadProbeReturn VideoComposite::rtp_timestamp_probe_cb(GstPad *pad,
-                                                         GstPadProbeInfo *info,
-                                                         gpointer user_data)
-{
-    auto *ctx = static_cast<BranchProbeCtx *>(user_data);
-    if (!ctx || !ctx->self)
-        return GST_PAD_PROBE_OK;
 
-    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
-    if (!buf)
-        return GST_PAD_PROBE_OK;
-
-    GstRTPBuffer rtp = GST_RTP_BUFFER_INIT;
-    if (!gst_rtp_buffer_map(buf, GST_MAP_READ, &rtp))
-        return GST_PAD_PROBE_OK;
-
-    bool found = false;
-    uint64_t ts_us = 0;
-
-    gboolean ext = gst_rtp_buffer_get_extension(&rtp);
-    if (ext) {
-        guint16 profile = 0;
-        gpointer data = nullptr;
-        guint wordlen = 0;
-        if (gst_rtp_buffer_get_extension_data(&rtp, &profile, &data, &wordlen)) {
-            if (profile == 0xBEDE && wordlen * 4 >= 12) {
-                guint8 *extdata = static_cast<guint8 *>(data);
-                memcpy(&ts_us, extdata + 1, sizeof(ts_us));
-                ts_us = GUINT64_FROM_BE(ts_us);
-                found = true;
-            }
-        }
-    }
-
-    gst_rtp_buffer_unmap(&rtp);
-
-    {
-        std::lock_guard<std::mutex> lock(ctx->self->frameTsMutex_);
-        if (ctx->branch_index >= 0 && ctx->branch_index < (int)ctx->self->latest_frame_ts_us_.size()) {
-            if (found) {
-                ctx->self->latest_frame_ts_us_[ctx->branch_index] = ts_us;
-                ctx->self->latest_frame_ts_valid_[ctx->branch_index] = true;
-            } else {
-                ctx->self->latest_frame_ts_valid_[ctx->branch_index] = false;
-            }
-        }
-    }
-
-    return GST_PAD_PROBE_OK;
-}
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                    const std::vector<int> &ports)
@@ -134,9 +83,10 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
     num_src = static_cast<int>(video_ports.size());
     stab.assign(num_src, nullptr);
     branch_active.assign(num_src, false);
+    // frame_pts_to_imu_offset_us_.assign(num_src, 11159520000LL);
+    frame_pts_to_imu_offset_us_.assign(num_src, 0LL);
 
-    latest_frame_ts_us_.assign(num_src, 0);
-    latest_frame_ts_valid_.assign(num_src, false);
+    // frame_ts_queue_us_.assign(num_src, std::deque<uint64_t>{});
 
     // (camera matrix initialization is now handled inside BuoyNode; not
     // needed here)
@@ -298,7 +248,8 @@ void VideoComposite::updateQuaternion(const buoy_proto::IMU_proto &msg) {
    inverse homography from the matching BuoyNode and applies it immediately to
    that branch's shader. */
 GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
-                                               gpointer user_data) {
+                                               gpointer user_data)
+{
     if (!(info->type & GST_PAD_PROBE_TYPE_BUFFER))
         return GST_PAD_PROBE_OK;
 
@@ -310,6 +261,22 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     const int i = ctx->branch_index;
     if (i < 0 || i >= self->num_src)
         return GST_PAD_PROBE_OK;
+
+    GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buf)
+        return GST_PAD_PROBE_OK;
+
+    uint64_t frame_ts_us = 0;
+    bool have_frame_ts = false;
+    if (GST_BUFFER_PTS_IS_VALID(buf)) {
+        frame_ts_us = GST_BUFFER_PTS(buf) / 1000;  // ns -> us
+        have_frame_ts = true;
+    }
+
+    int64_t query_ts_us = static_cast<int64_t>(frame_ts_us);
+    if (i < (int)self->frame_pts_to_imu_offset_us_.size()) {
+        query_ts_us += self->frame_pts_to_imu_offset_us_[i];
+    }
 
     int idx = i;
     const char *env = getenv("IMU_ALL");
@@ -325,50 +292,42 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     for (int j = 0; j < 9; ++j)
         H[j] = (j % 4 == 0) ? 1.0f : 0.0f;
 
-    uint64_t frame_ts_us = 0;
-    bool have_frame_ts = false;
-    {
-        std::lock_guard<std::mutex> lock(self->frameTsMutex_);
-        if (i < (int)self->latest_frame_ts_us_.size()) {
-            have_frame_ts = self->latest_frame_ts_valid_[i];
-            frame_ts_us = self->latest_frame_ts_us_[i];
-        }
-    }
-
     uint64_t best_diff_us = 0;
     bool got_hinv = false;
+    bool used_latest_fallback = false;
+
     if (self->nodes_ && idx < (int)self->nodes_->size()) {
-        if (have_frame_ts) {
-            got_hinv = (*self->nodes_)[idx]->getHinvAt(frame_ts_us, H, &best_diff_us);
+        if (have_frame_ts && query_ts_us >= 0) {
+            got_hinv = (*self->nodes_)[idx]->getHinvAt(
+                static_cast<uint64_t>(query_ts_us), H, &best_diff_us);
         }
+
         if (!got_hinv) {
             auto mat = (*self->nodes_)[idx]->getHinv();
             for (int j = 0; j < 9; ++j)
                 H[j] = mat[j];
             got_hinv = true;
+            used_latest_fallback = true;
         }
     }
 
-    // for (int j = 0; j < 9; ++j)
-    //     H[j] = (j % 4 == 0) ? 1.0f : 0.0f;
-
     GstStructure *vars = gst_structure_new("uniforms",
-                                        "k1", G_TYPE_FLOAT, self->live_k1,
-                                        "zoom", G_TYPE_FLOAT, self->live_zoom,
-                                        "w", G_TYPE_FLOAT, 1920.0f,
-                                        "h", G_TYPE_FLOAT, 1080.0f,
-                                        "h00", G_TYPE_FLOAT, H[0],
-                                        "h01", G_TYPE_FLOAT, H[1],
-                                        "h02", G_TYPE_FLOAT, H[2],
-                                        "h10", G_TYPE_FLOAT, H[3],
-                                        "h11", G_TYPE_FLOAT, H[4],
-                                        "h12", G_TYPE_FLOAT, H[5],
-                                        "h20", G_TYPE_FLOAT, H[6],
-                                        "h21", G_TYPE_FLOAT, H[7],
-                                        "h22", G_TYPE_FLOAT, H[8],
-                                        NULL);
+                                           "k1", G_TYPE_FLOAT, self->live_k1,
+                                           "zoom", G_TYPE_FLOAT, self->live_zoom,
+                                           "w", G_TYPE_FLOAT, 1920.0f,
+                                           "h", G_TYPE_FLOAT, 1080.0f,
+                                           "h00", G_TYPE_FLOAT, H[0],
+                                           "h01", G_TYPE_FLOAT, H[1],
+                                           "h02", G_TYPE_FLOAT, H[2],
+                                           "h10", G_TYPE_FLOAT, H[3],
+                                           "h11", G_TYPE_FLOAT, H[4],
+                                           "h12", G_TYPE_FLOAT, H[5],
+                                           "h20", G_TYPE_FLOAT, H[6],
+                                           "h21", G_TYPE_FLOAT, H[7],
+                                           "h22", G_TYPE_FLOAT, H[8],
+                                           NULL);
 
-    char name[16];
+    char name[32];
     snprintf(name, sizeof(name), "lens%d", i);
     GstElement *shader = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
     if (shader) {
@@ -385,12 +344,35 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
                      NULL);
     }
 
+    static uint64_t last_frame_ts_us = 0;
+    uint64_t frame_dt_us = 0;
+    if (last_frame_ts_us != 0 && frame_ts_us > last_frame_ts_us) {
+        frame_dt_us = frame_ts_us - last_frame_ts_us;
+    }
+    last_frame_ts_us = frame_ts_us;
+
     static uint64_t print_counter = 0;
     if ((++print_counter % 240) == 0) {
+        int64_t offset_us = 0;
+        if (i < (int)self->frame_pts_to_imu_offset_us_.size()) {
+            offset_us = self->frame_pts_to_imu_offset_us_[i];
+        }
+
         g_print("[branch %d] frame_ts_us=%" G_GUINT64_FORMAT
-        " best_diff_us=%" G_GUINT64_FORMAT
-        " have_frame_ts=%d\n",
-        i, frame_ts_us, best_diff_us, have_frame_ts ? 1 : 0);
+                " frame_dt_us=%" G_GUINT64_FORMAT
+                " query_ts_us=%" G_GINT64_FORMAT
+                " offset_us=%" G_GINT64_FORMAT
+                " best_diff_us=%" G_GUINT64_FORMAT
+                " fallback=%d"
+                " have_frame_ts=%d\n",
+                i,
+                frame_ts_us,
+                frame_dt_us,
+                query_ts_us,
+                offset_us,
+                best_diff_us,
+                used_latest_fallback ? 1 : 0,
+                have_frame_ts ? 1 : 0);
     }
 
     return GST_PAD_PROBE_OK;
@@ -431,7 +413,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     g_object_set(fps,
                  "video-sink", videosink,
                  "text-overlay", TRUE,
-                 "sync", TRUE,
+                 "sync", FALSE,
                  NULL);
 
     gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, NULL);
@@ -512,7 +494,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
 
     for (int i = 0; i < self->num_src; ++i) {
         char udpsrc_nm[32], jitter_nm[32], depay_nm[32], parse_nm[32], dec_nm[32];
-        char conv_nm[32], rate_nm[32], capsf_nm[32], glup_nm[32], queue_nm[32];
+        char conv_nm[32], glup_nm[32], queue_nm[32];
         char shader_nm[32], stab_nm[32];
 
         snprintf(udpsrc_nm, sizeof(udpsrc_nm), "udpsrc%d", i);
@@ -521,8 +503,6 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         snprintf(parse_nm, sizeof(parse_nm), "parse%d", i);
         snprintf(dec_nm, sizeof(dec_nm), "dec%d", i);
         snprintf(conv_nm, sizeof(conv_nm), "conv%d", i);
-        snprintf(rate_nm, sizeof(rate_nm), "rate%d", i);
-        snprintf(capsf_nm, sizeof(capsf_nm), "capsf%d", i);
         snprintf(glup_nm, sizeof(glup_nm), "glup%d", i);
         snprintf(queue_nm, sizeof(queue_nm), "queue%d", i);
         snprintf(shader_nm, sizeof(shader_nm), "lens%d", i);
@@ -534,15 +514,13 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         GstElement *parse  = gst_element_factory_make("h264parse", parse_nm);
         GstElement *dec    = gst_element_factory_make("avdec_h264", dec_nm);
         GstElement *conv   = gst_element_factory_make("videoconvert", conv_nm);
-        GstElement *rate   = gst_element_factory_make("videorate", rate_nm);
-        GstElement *capsf  = gst_element_factory_make("capsfilter", capsf_nm);
         GstElement *glup   = gst_element_factory_make("glupload", glup_nm);
         GstElement *shader = gst_element_factory_make("glshader", shader_nm);
         GstElement *stab   = gst_element_factory_make("gltransformation", stab_nm);
         GstElement *queue  = gst_element_factory_make("queue", queue_nm);
 
         if (!udpsrc || !jitter || !depay || !parse || !dec || !conv ||
-            !rate || !capsf || !glup || !shader || !stab || !queue) {
+            !glup || !shader || !stab || !queue) {
             g_printerr("run_pipeline: failed to create udp branch %d elements\n", i);
             return NULL;
         }
@@ -561,22 +539,17 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
 
         g_object_set(jitter, "latency", 0, "drop-on-latency", TRUE, NULL);
 
-        GstCaps *caps2 = gst_caps_from_string("video/x-raw,framerate=60/1");
-        g_object_set(capsf, "caps", caps2, NULL);
-        gst_caps_unref(caps2);
-
         gst_bin_add_many(GST_BIN(self->pipeline),
                          udpsrc, jitter, depay, parse, dec,
-                         conv, rate, capsf, glup, shader, stab, queue, NULL);
+                         conv, glup, shader, stab, queue, NULL);
 
         if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec,
-                                   conv, rate, capsf, glup, shader, stab, queue, NULL)) {
+                                   conv, glup, shader, stab, queue, NULL)) {
             g_printerr("run_pipeline: udp branch %d link failed\n", i);
             return NULL;
         }
 
         g_object_set(shader, "fragment", self->shader_code.c_str(), NULL);
-
         self->stab[i] = GST_ELEMENT(gst_object_ref(stab));
 
         GstPad *sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
@@ -611,25 +584,10 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         gst_object_unref(srcpad);
         gst_object_unref(sinkpad);
 
-        /* per-branch probes */
         auto *ctx = new BranchProbeCtx();
         ctx->self = self;
         ctx->branch_index = i;
         probe_ctxs.push_back(ctx);
-
-        {
-            GstPad *rtp_pad = gst_element_get_static_pad(jitter, "sink");
-            if (rtp_pad) {
-                gst_pad_add_probe(rtp_pad,
-                                  GST_PAD_PROBE_TYPE_BUFFER,
-                                  VideoComposite::rtp_timestamp_probe_cb,
-                                  ctx,
-                                  NULL);
-                gst_object_unref(rtp_pad);
-            } else {
-                g_printerr("run_pipeline: failed to get jitter sink pad for branch %d\n", i);
-            }
-        }
 
         {
             GstPad *imu_pad = gst_element_get_static_pad(glup, "src");

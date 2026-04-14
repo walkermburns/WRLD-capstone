@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 #include <array>
+#include <deque>
+#include <cstdint>
 
 // forward declare BuoyNode so we can hold a pointer to the vector without
 // including its header (avoids circular dependency)
@@ -79,12 +81,6 @@ private:
     float live_h10, live_h11, live_h12;
     float live_h20, live_h21, live_h22;
 
-    // per-branch latest sender timestamp (microseconds) extracted from RTP
-    // extension headers.  Written by RTP pad probes and read by shader probes.
-    std::mutex frameTsMutex_;
-    std::vector<uint64_t> latest_frame_ts_us_;
-    std::vector<bool> latest_frame_ts_valid_;
-
     // quaternion/matrix helper functions are defined in MathHelpers
     // (no need to redeclare here).  implementations live in MathHelpers.{h,cpp}
 
@@ -115,6 +111,8 @@ private:
                      float h00 = 1.0f, float h01 = 0.0f, float h02 = 0.0f,
                      float h10 = 0.0f, float h11 = 1.0f, float h12 = 0.0f,
                      float h20 = 0.0f, float h21 = 0.0f, float h22 = 1.0f);
+
+    std::vector<int64_t> frame_pts_to_imu_offset_us_;
 
 };
 

@@ -380,21 +380,25 @@ std::array<float,9> BuoyNode::getHinv() const {
 //     return found;
 // }
 
-bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out,
-                         uint64_t *best_diff_us) const {
+bool BuoyNode::getHinvAt(uint64_t timestamp,
+                         std::array<float,9> &out,
+                         uint64_t *best_diff_us) const
+{
     std::lock_guard<std::mutex> lock(quatMutex_);
+
     if (hist_.empty())
         return false;
 
     uint64_t bestDiff = UINT64_MAX;
     bool found = false;
 
-    for (const auto &p : hist_) {
-        uint64_t diff = (p.first > timestamp) ? (p.first - timestamp)
-                                              : (timestamp - p.first);
+    for (const auto &entry : hist_) {
+        uint64_t t = entry.first;
+        uint64_t diff = (t > timestamp) ? (t - timestamp) : (timestamp - t);
+
         if (diff < bestDiff) {
             bestDiff = diff;
-            out = p.second;
+            out = entry.second;
             found = true;
         }
     }
@@ -402,7 +406,13 @@ bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out,
     if (best_diff_us)
         *best_diff_us = bestDiff;
 
-    return found;
+    if (!found)
+        return false;
+
+    if (bestDiff > max_hinv_match_diff_us_)
+        return false;
+
+    return true;
 }
 
 // static helper -------------------------------------------------------------
@@ -425,17 +435,17 @@ void BuoyNode::printMessage(const std::string &name,
     lastPrint[name] = now;
 
     const int W = 8;
-    std::cout << '[' << name << "]\n";
-    std::cout << "  " << std::left << std::setw(W) << "acc_x"  << ": " << msg.acc_x()  << "\n"
-              << "  " << std::left << std::setw(W) << "acc_y"  << ": " << msg.acc_y()  << "\n"
-              << "  " << std::left << std::setw(W) << "acc_z"  << ": " << msg.acc_z()  << "\n"
-              << "  " << std::left << std::setw(W) << "gyr_x"  << ": " << msg.gyr_x()  << "\n"
-              << "  " << std::left << std::setw(W) << "gyr_y"  << ": " << msg.gyr_y()  << "\n"
-              << "  " << std::left << std::setw(W) << "gyr_z"  << ": " << msg.gyr_z()  << "\n"
-              << "  " << std::left << std::setw(W) << "quat_w" << ": " << msg.quat_w() << "\n"
-              << "  " << std::left << std::setw(W) << "quat_x" << ": " << msg.quat_x() << "\n"
-              << "  " << std::left << std::setw(W) << "quat_y" << ": " << msg.quat_y() << "\n"
-              << "  " << std::left << std::setw(W) << "quat_z" << ": " << msg.quat_z() << "\n"
-              << "  " << std::left << std::setw(W) << "timestamp" << ": " << msg.timestamp() << "\n";
-    std::cout << std::endl;
+    // std::cout << '[' << name << "]\n";
+    // std::cout << "  " << std::left << std::setw(W) << "acc_x"  << ": " << msg.acc_x()  << "\n"
+    //           << "  " << std::left << std::setw(W) << "acc_y"  << ": " << msg.acc_y()  << "\n"
+    //           << "  " << std::left << std::setw(W) << "acc_z"  << ": " << msg.acc_z()  << "\n"
+    //           << "  " << std::left << std::setw(W) << "gyr_x"  << ": " << msg.gyr_x()  << "\n"
+    //           << "  " << std::left << std::setw(W) << "gyr_y"  << ": " << msg.gyr_y()  << "\n"
+    //           << "  " << std::left << std::setw(W) << "gyr_z"  << ": " << msg.gyr_z()  << "\n"
+    //           << "  " << std::left << std::setw(W) << "quat_w" << ": " << msg.quat_w() << "\n"
+    //           << "  " << std::left << std::setw(W) << "quat_x" << ": " << msg.quat_x() << "\n"
+    //           << "  " << std::left << std::setw(W) << "quat_y" << ": " << msg.quat_y() << "\n"
+    //           << "  " << std::left << std::setw(W) << "quat_z" << ": " << msg.quat_z() << "\n"
+    //           << "  " << std::left << std::setw(W) << "timestamp" << ": " << msg.timestamp() << "\n";
+    // std::cout << std::endl;
 }

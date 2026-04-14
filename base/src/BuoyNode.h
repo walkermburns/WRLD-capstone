@@ -107,6 +107,9 @@ private:
     // push/pop at both ends.
     std::deque<std::pair<uint64_t,std::array<float,9>>> hist_;
 
+    // reject timestamp matches that are too far away
+    uint64_t max_hinv_match_diff_us_ = 20000;  // 20 ms
+
     // helper to initialize camera matrices; called from constructors
     void initCameraMatrices();
     void initDebugCsv();
@@ -123,8 +126,8 @@ private:
     uint64_t last_omega_ts_ = 0;
 
     // prediction tuning
-    float predict_lead_s_ = 0.010f;      // 10 ms lead
-    float predict_max_s_  = 0.30f;      // clamp same spirit as python
+    float predict_lead_s_ = 0.0f;      // 10 ms lead
+    float predict_max_s_  = 0.0f;      // clamp same spirit as python
     float omega_alpha_    = 0.1f;       // matches python prototype
     float omega_clamp_    = 2.0f;       // rad/s clamp
 };
