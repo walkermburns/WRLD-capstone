@@ -383,10 +383,9 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     static uint64_t print_counter = 0;
     if ((++print_counter % 240) == 0) {
         g_print("[branch %d] frame_ts_us=%" G_GUINT64_FORMAT
-                " best_diff_us=%" G_GUINT64_FORMAT
-                " have_frame_ts=%d
-",
-                i, frame_ts_us, best_diff_us, have_frame_ts ? 1 : 0);
+        " best_diff_us=%" G_GUINT64_FORMAT
+        " have_frame_ts=%d\n",
+        i, frame_ts_us, best_diff_us, have_frame_ts ? 1 : 0);
     }
 
     return GST_PAD_PROBE_OK;
