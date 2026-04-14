@@ -122,7 +122,7 @@ GstPadProbeReturn VideoComposite::rtp_timestamp_probe_cb(GstPad *pad,
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                    const std::vector<int> &ports)
     : pipeline(nullptr), mix_element(nullptr), live_k1(0.3f), live_zoom(1.1f),
-      live_w(0.0f), live_h(0.0f),
+      live_w(1920.0f), live_h(1080.0f),
       live_h00(1.0f), live_h01(0.0f), live_h02(0.0f),
       live_h10(0.0f), live_h11(1.0f), live_h12(0.0f),
       live_h20(0.0f), live_h21(0.0f), live_h22(1.0f),
@@ -349,29 +349,34 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
         }
     }
 
-    gst_structure_set(self->uniforms,
-                      "k1", G_TYPE_FLOAT, self->live_k1,
-                      "zoom", G_TYPE_FLOAT, self->live_zoom,
-                      "w", G_TYPE_FLOAT, 1920.0f,
-                      "h", G_TYPE_FLOAT, 1080.0f,
-                      "h00", G_TYPE_FLOAT, H[0],
-                      "h01", G_TYPE_FLOAT, H[1],
-                      "h02", G_TYPE_FLOAT, H[2],
-                      "h10", G_TYPE_FLOAT, H[3],
-                      "h11", G_TYPE_FLOAT, H[4],
-                      "h12", G_TYPE_FLOAT, H[5],
-                      "h20", G_TYPE_FLOAT, H[6],
-                      "h21", G_TYPE_FLOAT, H[7],
-                      "h22", G_TYPE_FLOAT, H[8],
-                      NULL);
+    // for (int j = 0; j < 9; ++j)
+    //     H[j] = (j % 4 == 0) ? 1.0f : 0.0f;
+
+    GstStructure *vars = gst_structure_new("uniforms",
+                                        "k1", G_TYPE_FLOAT, self->live_k1,
+                                        "zoom", G_TYPE_FLOAT, self->live_zoom,
+                                        "w", G_TYPE_FLOAT, 1920.0f,
+                                        "h", G_TYPE_FLOAT, 1080.0f,
+                                        "h00", G_TYPE_FLOAT, H[0],
+                                        "h01", G_TYPE_FLOAT, H[1],
+                                        "h02", G_TYPE_FLOAT, H[2],
+                                        "h10", G_TYPE_FLOAT, H[3],
+                                        "h11", G_TYPE_FLOAT, H[4],
+                                        "h12", G_TYPE_FLOAT, H[5],
+                                        "h20", G_TYPE_FLOAT, H[6],
+                                        "h21", G_TYPE_FLOAT, H[7],
+                                        "h22", G_TYPE_FLOAT, H[8],
+                                        NULL);
 
     char name[16];
     snprintf(name, sizeof(name), "lens%d", i);
     GstElement *shader = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
     if (shader) {
-        g_object_set(shader, "uniforms", self->uniforms, NULL);
+        g_object_set(shader, "uniforms", vars, NULL);
         gst_object_unref(shader);
     }
+
+    gst_structure_free(vars);
 
     if (i < (int)self->stab.size() && self->stab[i]) {
         g_object_set(self->stab[i],
@@ -392,24 +397,20 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
 }
 
 void *VideoComposite::run_pipeline(gpointer user_data) {
-    // nothing special here, but we might in future forward nodes to the
-    // thread etc.
     VideoComposite *self = static_cast<VideoComposite *>(user_data);
     if (!self) {
-        // fallback to static instance (macOS behaviour can be weird)
         self = s_instance;
     }
     if (!self) {
         g_printerr("run_pipeline: user_data is NULL and no fallback instance\n");
         return NULL;
     }
+
     g_print("run_pipeline: self=%p\n", (void*)self);
-    GMainLoop *loop;
-    GError *error = NULL;
+
+    GMainLoop *loop = nullptr;
     std::vector<BranchProbeCtx*> probe_ctxs;
 
-    /* create pipeline and elements manually so the number/resolution/position
-       of mixer sinks can be changed at runtime. */
     self->pipeline = gst_pipeline_new("video_pipeline");
     if (!self->pipeline) {
         g_printerr("run_pipeline: failed to create pipeline\n");
@@ -419,8 +420,8 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     GstElement *mix = gst_element_factory_make("glvideomixer", "mix");
     GstElement *convert = gst_element_factory_make("glcolorconvert", "conv");
     GstElement *fps = gst_element_factory_make("fpsdisplaysink", "fps");
-    // GstElement *videosink = gst_element_factory_make("autovideosink", "vsink");
     GstElement *videosink = gst_element_factory_make("glimagesink", "vsink");
+
     if (!mix || !convert || !fps || !videosink) {
         g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
@@ -433,53 +434,44 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
                  "sync", TRUE,
                  NULL);
 
-    /* add all elements to pipeline except videosink (fpsdisplaysink owns it) */
-    
-    // NOTE: we used to add videosink here and link it to fps, but chat said to not so...
-    // gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, videosink, NULL);
-
     gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, NULL);
     if (!gst_element_link_many(mix, convert, fps, NULL)) {
         g_printerr("run_pipeline: failed to link core elements\n");
         return NULL;
     }
-    /* no need to link fps->videosink; fpsdisplaysink handles its child sink */
 
-    /* we'll use mix pointer below when attaching branches */
-
-    /* dynamic configuration for mixer sinks; change values or number here
-       we want a 2x2 grid for the UDP sources and a full-screen background test
-       pattern.  The background element is created separately below. */
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
     layouts.reserve(self->num_src);
     for (int i = 0; i < self->num_src; ++i) {
-        /* compute side-by-side horizontal layout */
         SinkLayout l;
-        l.xpos  = i * 1920;  // each stream offset horizontally
-        l.ypos  = 0;
-        l.width = 1920;
-        l.height= 1080;
+        l.xpos   = i * 1920;
+        l.ypos   = 0;
+        l.width  = 1920;
+        l.height = 1080;
         layouts.push_back(l);
     }
-    /* background resolution should cover all sources horizontally */
-    gint bg_width = (self->num_src > 0 ? self->num_src : 1) * 1920;
-    gint bg_height = 1080; // match individual source height
 
+    gint bg_width  = (self->num_src > 0 ? self->num_src : 1) * 1920;
+    gint bg_height = 1080;
 
-    /*--- background branch ------------------------------------------------*/
+    /* --- background branch --- */
     {
-        GstElement *bg_src   = gst_element_factory_make("videotestsrc", "bg_src");
-        GstElement *bg_caps  = gst_element_factory_make("capsfilter", "bg_caps");
-        GstElement *bg_glup  = gst_element_factory_make("glupload", "bg_glup");
+        GstElement *bg_src  = gst_element_factory_make("videotestsrc", "bg_src");
+        GstElement *bg_caps = gst_element_factory_make("capsfilter", "bg_caps");
+        GstElement *bg_glup = gst_element_factory_make("glupload", "bg_glup");
+
         if (!bg_src || !bg_caps || !bg_glup) {
             g_printerr("run_pipeline: failed to create background elements\n");
             return NULL;
         }
+
         g_object_set(bg_src, "pattern", 0, "is-live", TRUE, NULL);
+
         GstCaps *bgcaps = gst_caps_from_string(
             (std::ostringstream() << "video/x-raw,width=" << bg_width
-             << ",height=" << bg_height << ",framerate=60/1").str().c_str());
+                                  << ",height=" << bg_height
+                                  << ",framerate=60/1").str().c_str());
         g_object_set(bg_caps, "caps", bgcaps, NULL);
         gst_caps_unref(bgcaps);
 
@@ -494,6 +486,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
             g_printerr("run_pipeline: could not get mixer pad for background\n");
             return NULL;
         }
+
         g_object_set(bg_sinkpad,
                      "xpos", 0,
                      "ypos", 0,
@@ -501,19 +494,27 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
                      "height", bg_height,
                      "zorder", 0,
                      NULL);
+
         GstPad *bg_srcpad = gst_element_get_static_pad(bg_glup, "src");
         if (gst_pad_link(bg_srcpad, bg_sinkpad) != GST_PAD_LINK_OK) {
             g_printerr("run_pipeline: failed to link background to mixer\n");
+            gst_object_unref(bg_srcpad);
+            gst_object_unref(bg_sinkpad);
             return NULL;
         }
+
         gst_object_unref(bg_srcpad);
         gst_object_unref(bg_sinkpad);
     }
 
-    /* create udp source branches and hook them to mixer pads */
+    /* --- UDP source branches --- */
+    self->stab.assign(self->num_src, nullptr);
+
     for (int i = 0; i < self->num_src; ++i) {
-        char udpsrc_nm[16], jitter_nm[16], depay_nm[16], parse_nm[16], dec_nm[16],
-             conv_nm[16], rate_nm[16], capsf_nm[16], glup_nm[16], queue_nm[16];
+        char udpsrc_nm[32], jitter_nm[32], depay_nm[32], parse_nm[32], dec_nm[32];
+        char conv_nm[32], rate_nm[32], capsf_nm[32], glup_nm[32], queue_nm[32];
+        char shader_nm[32], stab_nm[32];
+
         snprintf(udpsrc_nm, sizeof(udpsrc_nm), "udpsrc%d", i);
         snprintf(jitter_nm, sizeof(jitter_nm), "jitter%d", i);
         snprintf(depay_nm, sizeof(depay_nm), "depay%d", i);
@@ -524,22 +525,21 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         snprintf(capsf_nm, sizeof(capsf_nm), "capsf%d", i);
         snprintf(glup_nm, sizeof(glup_nm), "glup%d", i);
         snprintf(queue_nm, sizeof(queue_nm), "queue%d", i);
-
-        GstElement *udpsrc    = gst_element_factory_make("udpsrc", udpsrc_nm);
-        GstElement *jitter    = gst_element_factory_make("rtpjitterbuffer", jitter_nm);
-        GstElement *depay     = gst_element_factory_make("rtph264depay", depay_nm);
-        GstElement *parse     = gst_element_factory_make("h264parse", parse_nm);
-        GstElement *dec       = gst_element_factory_make("avdec_h264", dec_nm);
-        GstElement *conv      = gst_element_factory_make("videoconvert", conv_nm);
-        GstElement *rate      = gst_element_factory_make("videorate", rate_nm);
-        GstElement *capsf     = gst_element_factory_make("capsfilter", capsf_nm);
-        GstElement *glup      = gst_element_factory_make("glupload", glup_nm);
-        char shader_nm[16], stab_nm[16];
         snprintf(shader_nm, sizeof(shader_nm), "lens%d", i);
         snprintf(stab_nm, sizeof(stab_nm), "stab%d", i);
-        GstElement *shader    = gst_element_factory_make("glshader", shader_nm);
-        GstElement *stab      = gst_element_factory_make("gltransformation", stab_nm);
-        GstElement *queue     = gst_element_factory_make("queue", queue_nm);
+
+        GstElement *udpsrc = gst_element_factory_make("udpsrc", udpsrc_nm);
+        GstElement *jitter = gst_element_factory_make("rtpjitterbuffer", jitter_nm);
+        GstElement *depay  = gst_element_factory_make("rtph264depay", depay_nm);
+        GstElement *parse  = gst_element_factory_make("h264parse", parse_nm);
+        GstElement *dec    = gst_element_factory_make("avdec_h264", dec_nm);
+        GstElement *conv   = gst_element_factory_make("videoconvert", conv_nm);
+        GstElement *rate   = gst_element_factory_make("videorate", rate_nm);
+        GstElement *capsf  = gst_element_factory_make("capsfilter", capsf_nm);
+        GstElement *glup   = gst_element_factory_make("glupload", glup_nm);
+        GstElement *shader = gst_element_factory_make("glshader", shader_nm);
+        GstElement *stab   = gst_element_factory_make("gltransformation", stab_nm);
+        GstElement *queue  = gst_element_factory_make("queue", queue_nm);
 
         if (!udpsrc || !jitter || !depay || !parse || !dec || !conv ||
             !rate || !capsf || !glup || !shader || !stab || !queue) {
@@ -547,20 +547,18 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
             return NULL;
         }
 
-        /* configure udp source and RTP caps */
         int port = (i < (int)self->video_ports.size() ? self->video_ports[i] : 0);
         if (port > 0) {
             g_object_set(udpsrc, "port", port, NULL);
         } else {
             g_printerr("run_pipeline: invalid port for branch %d\n", i);
         }
+
         GstCaps *rtpcaps = gst_caps_from_string(
-            "application/x-rtp,media=video,encoding-name=H264,"
-            "payload=96,clock-rate=90000");
+            "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000");
         g_object_set(udpsrc, "caps", rtpcaps, NULL);
         gst_caps_unref(rtpcaps);
-        // increase latency if there are issues, higher latency will cause frame
-        // drop and desync if source is delayed or doesn't exist.
+
         g_object_set(jitter, "latency", 0, "drop-on-latency", TRUE, NULL);
 
         GstCaps *caps2 = gst_caps_from_string("video/x-raw,framerate=60/1");
@@ -572,11 +570,14 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
                          conv, rate, capsf, glup, shader, stab, queue, NULL);
 
         if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec,
-                                   conv, rate, capsf, glup, shader, stab,
-                                   queue, NULL)) {
+                                   conv, rate, capsf, glup, shader, stab, queue, NULL)) {
             g_printerr("run_pipeline: udp branch %d link failed\n", i);
             return NULL;
         }
+
+        g_object_set(shader, "fragment", self->shader_code.c_str(), NULL);
+
+        self->stab[i] = GST_ELEMENT(gst_object_ref(stab));
 
         GstPad *sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
         if (!sinkpad) {
@@ -584,52 +585,67 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
             return NULL;
         }
 
-        /* apply dynamic layout
-           (could be reassigned while running by reconfiguring pad properties) */
         const SinkLayout &l = layouts[i];
         g_object_set(sinkpad,
-                     "xpos",   l.xpos,
-                     "ypos",   l.ypos,
-                     "width",  l.width,
+                     "xpos", l.xpos,
+                     "ypos", l.ypos,
+                     "width", l.width,
                      "height", l.height,
+                     "zorder", i + 1,
                      NULL);
 
-        /* link the *queue* output, not the stab element; queue is last in
-           the branch chain so it provides a stable src pad for the mixer */
         GstPad *srcpad = gst_element_get_static_pad(queue, "src");
-        if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
-            g_printerr("run_pipeline: failed to link branch %d to mixer\n", i);
+        if (!srcpad) {
+            g_printerr("run_pipeline: failed to get queue src pad for branch %d\n", i);
+            gst_object_unref(sinkpad);
             return NULL;
         }
-        gst_object_unref(srcpad);
-        /* set ordering so background stays at bottom */
-        g_object_set(sinkpad, "zorder", i + 1, NULL);
-        gst_object_unref(sinkpad);
-    }
 
-    /* shaders and stabs can still be configured by name; use num_src */
-    for (int i = 0; i < self->num_src; i++) {
-        char name[16];
-        snprintf(name, sizeof(name), "lens%d", i);
-        GstElement *shader_elem = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
-        if (shader_elem) {
-            g_object_set(shader_elem, "fragment", self->shader_code.c_str(), NULL);
-            /* no signals; uniforms will be updated via pad probe each frame */
-            gst_object_unref(shader_elem);
+        if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
+            g_printerr("run_pipeline: failed to link branch %d to mixer\n", i);
+            gst_object_unref(srcpad);
+            gst_object_unref(sinkpad);
+            return NULL;
+        }
+
+        gst_object_unref(srcpad);
+        gst_object_unref(sinkpad);
+
+        /* per-branch probes */
+        auto *ctx = new BranchProbeCtx();
+        ctx->self = self;
+        ctx->branch_index = i;
+        probe_ctxs.push_back(ctx);
+
+        {
+            GstPad *rtp_pad = gst_element_get_static_pad(jitter, "sink");
+            if (rtp_pad) {
+                gst_pad_add_probe(rtp_pad,
+                                  GST_PAD_PROBE_TYPE_BUFFER,
+                                  VideoComposite::rtp_timestamp_probe_cb,
+                                  ctx,
+                                  NULL);
+                gst_object_unref(rtp_pad);
+            } else {
+                g_printerr("run_pipeline: failed to get jitter sink pad for branch %d\n", i);
+            }
+        }
+
+        {
+            GstPad *imu_pad = gst_element_get_static_pad(glup, "src");
+            if (imu_pad) {
+                gst_pad_add_probe(imu_pad,
+                                  GST_PAD_PROBE_TYPE_BUFFER,
+                                  VideoComposite::imu_probe_cb,
+                                  ctx,
+                                  NULL);
+                gst_object_unref(imu_pad);
+            } else {
+                g_printerr("run_pipeline: failed to get glup src pad for branch %d\n", i);
+            }
         }
     }
 
-    /* update stab pointers vector to match current num_src */
-    self->stab.assign(self->num_src, nullptr);
-    for (int i = 0; i < self->num_src; ++i) {
-        char name[16];
-        snprintf(name, sizeof(name), "stab%d", i);
-        self->stab[i] = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
-    }
-
-    /* install bus watch so we can see errors/warnings from any element (e.g.
-       shader compilation failures).  message callback will continue running
-       until the pipeline is torn down. */
     {
         GstBus *bus = gst_element_get_bus(self->pipeline);
         gst_bus_add_watch(bus, bus_call, nullptr);
@@ -639,15 +655,19 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     gst_element_set_state(self->pipeline, GST_STATE_PLAYING);
 
     loop = g_main_loop_new(NULL, FALSE);
-    g_print("Running Fake IMU Stabilization Test at 4K (4x 1080p). Press Ctrl+C to stop.\n");
+    g_print("Running base station. Press Ctrl+C to stop.\n");
     g_main_loop_run(loop);
 
     gst_element_set_state(self->pipeline, GST_STATE_NULL);
+
     for (auto *s : self->stab) {
-        if (s) gst_object_unref(s);
+        if (s)
+            gst_object_unref(s);
     }
+
     gst_object_unref(self->pipeline);
     g_main_loop_unref(loop);
+
     for (auto *ctx : probe_ctxs)
         delete ctx;
 
