@@ -7,7 +7,6 @@ uniform sampler2D tex;
 uniform float w;
 uniform float h;
 
-// inverse homography (dest->src) in pixel coordinates
 uniform float h00; uniform float h01; uniform float h02;
 uniform float h10; uniform float h11; uniform float h12;
 uniform float h20; uniform float h21; uniform float h22;
@@ -21,9 +20,21 @@ void main() {
     q.y = h10*p.x + h11*p.y + h12;
     q.z = h20*p.x + h21*p.y + h22;
 
-    vec2 uv_pix = q.xy / q.z;
-    uv_pix = clamp(uv_pix, vec2(0.0), vec2(w - 1.0, h - 1.0));
-    vec2 uv = uv_pix / vec2(w, h);
+    // Prevent divide-by-zero / invalid projection
+    if (abs(q.z) < 1e-6) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
 
+    vec2 uv_pix = q.xy / q.z;
+
+    // If projected pixel is outside image bounds, output black
+    if (uv_pix.x < 0.0 || uv_pix.x >= w ||
+        uv_pix.y < 0.0 || uv_pix.y >= h) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    vec2 uv = uv_pix / vec2(w, h);
     fragColor = texture(tex, uv);
 }

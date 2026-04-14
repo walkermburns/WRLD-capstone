@@ -8,73 +8,199 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R, Slerp
 
 PORT = "/dev/ttyUSB0"
-BAUD = 115200
+BAUD = 460800
 
-arduino_rate_hz = 50
-camera_fps = 30
-buffer_time_length_s = 4
+ARDUINO_RATE_HZ = 100
+CAMERA_FPS = 30
+BUFFER_TIME_LENGTH_S = 4.0
 
-video_delay_s = 0.05
+VIDEO_DELAY_S = 0.01
+ROT_SMOOTH_ALPHA = 1.0
+USE_QUAT_CONJUGATE = False
+SHOW_PREVIEW = True
 
-quat_buffer = deque(maxlen = buffer_time_length_s * arduino_rate_hz)
-ypr_buffer = deque(maxlen = buffer_time_length_s * arduino_rate_hz)
-frame_buffer = deque(maxlen = buffer_time_length_s * camera_fps)
+quat_buffer = deque(maxlen=int(BUFFER_TIME_LENGTH_S * ARDUINO_RATE_HZ))
+frame_buffer = deque(maxlen=int(BUFFER_TIME_LENGTH_S * CAMERA_FPS))
 
+buffer_lock = threading.Lock()
 stop_threads_flag = threading.Event()
 
+
+def normalize_vec(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return v.copy()
+    return v / n
+
+
+def slerp_two(qa: R, qb: R, alpha: float) -> R:
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    if alpha <= 0.0:
+        return qa
+    if alpha >= 1.0:
+        return qb
+
+    key_times = np.array([0.0, 1.0], dtype=float)
+    key_rots = R.concatenate([qa, qb])
+    s = Slerp(key_times, key_rots)
+    return s([alpha])[0]
+
+
+def rotation_align_a_to_b(a_in: np.ndarray, b_in: np.ndarray) -> R:
+    """
+    Return rotation that maps vector a onto vector b.
+    Mirrors the C++ rotation_align_a_to_b() logic.
+    """
+    a = normalize_vec(a_in)
+    b = normalize_vec(b_in)
+
+    c = float(np.clip(np.dot(a, b), -1.0, 1.0))
+
+    if c > 1.0 - 1e-8:
+        return R.identity()
+
+    if c < -1.0 + 1e-8:
+        trial = np.array([1.0, 0.0, 0.0], dtype=float)
+        if abs(np.dot(a, trial)) > 0.9:
+            trial = np.array([0.0, 1.0, 0.0], dtype=float)
+        axis = normalize_vec(np.cross(a, trial))
+        return R.from_rotvec(math.pi * axis)
+
+    v = np.cross(a, b)
+    s = np.linalg.norm(v)
+
+    vx = np.array([
+        [0.0,    -v[2],  v[1]],
+        [v[2],   0.0,   -v[0]],
+        [-v[1],  v[0],   0.0]
+    ], dtype=float)
+
+    Rm = np.eye(3) + vx + vx @ vx * ((1.0 - c) / (s * s))
+    return R.from_matrix(Rm)
+
+
+def homography_is_safe(H: np.ndarray, w: int, h: int) -> bool:
+    pts = np.array([
+        [0.0, 0.0],
+        [w - 1.0, 0.0],
+        [0.0, h - 1.0],
+        [w - 1.0, h - 1.0],
+        [0.5 * w, 0.5 * h]
+    ], dtype=float)
+
+    for px, py in pts:
+        x = np.array([px, py, 1.0], dtype=float)
+        q = H @ x
+        z = q[2]
+        if abs(z) < 1e-6:
+            return False
+        u = q[0] / z
+        v = q[1] / z
+        if not np.isfinite(u) or not np.isfinite(v):
+            return False
+        if abs(u) > 5.0 * w or abs(v) > 5.0 * h:
+            return False
+    return True
+
+
 def parse_imu_data(serial_line: str):
-    quat_data = {}
-    ypr_data = {}
-    split_array = serial_line.split(',')
-    
-    ypr_data['roll_deg'] = float(split_array[0])
-    ypr_data['pitch_deg'] = float(split_array[1])
-    ypr_data['yaw_deg'] = float(split_array[2])
-    quat_data = [float(split_array[4]), float(split_array[5]), float(split_array[6]), float(split_array[3])]
-    # quat_data['w'] = float(split_array[3])
-    # quat_data['x'] = float(split_array[4])
-    # quat_data['y'] = float(split_array[5])
-    # quat_data['z'] = float(split_array[6])
-    
-    return quat_data, ypr_data
+    """
+    Arduino format:
+    sample_idx,mcu_time_us,qw,qx,qy,qz
+    """
+    parts = serial_line.split(",")
+    if len(parts) != 6:
+        raise ValueError(f"Expected 6 fields, got {len(parts)}: {serial_line}")
+
+    sample_idx = int(parts[0])
+    mcu_time_us = int(parts[1])
+
+    qw = float(parts[2])
+    qx = float(parts[3])
+    qy = float(parts[4])
+    qz = float(parts[5])
+
+    if USE_QUAT_CONJUGATE:
+        qx, qy, qz = -qx, -qy, -qz
+
+    quat_xyzw = np.array([qx, qy, qz, qw], dtype=float)
+    norm = np.linalg.norm(quat_xyzw)
+    if norm <= 1e-12:
+        raise ValueError("Quaternion norm is zero")
+    quat_xyzw /= norm
+
+    return sample_idx, mcu_time_us, quat_xyzw
+
 
 def read_arduino_serial(ser: serial.Serial):
+    have_prev_q = False
+    prev_q = None
+
     while not stop_threads_flag.is_set():
         try:
-            line = ser.read_until().decode("utf-8", errors="replace").strip()
-            # print(line)
+            line = ser.readline().decode("utf-8", errors="replace").strip()
             if not line:
-                # print('Invalid line')
                 continue
-            
-            # if line:
-            #     print(line)
-            
-            quat_data, ypr_data = parse_imu_data(line)
-            
-            t = time.perf_counter()
-            
-            quat_buffer.append([t, quat_data])
-            ypr_buffer.append([t, ypr_data])
-            
-            # print(len(ypr_buffer))
-            
+
+            sample_idx, mcu_time_us, quat_xyzw = parse_imu_data(line)
+
+            # Enforce quaternion sign continuity, matching the C++ logic.
+            if have_prev_q and np.dot(prev_q, quat_xyzw) < 0.0:
+                quat_xyzw = -quat_xyzw
+
+            prev_q = quat_xyzw.copy()
+            have_prev_q = True
+
+            t_host = time.perf_counter()
+
+            with buffer_lock:
+                quat_buffer.append((t_host, quat_xyzw, sample_idx, mcu_time_us))
+
         except Exception:
             continue
-    
-def get_quat_at_query_time(t_query):
-    
-    time_array = np.array([t[0] for t in quat_buffer], dtype=float)
-    quat_array = np.array([q[1] for q in quat_buffer], dtype=float)
-    # quats_x = quats_dict['x']
-    # print(';assdf')
+
+
+def get_quat_at_query_time(t_query: float):
+    """
+    Interpolate quaternion in host time.
+    Returns:
+        rot: scipy Rotation
+        newest_imu_time: float
+    """
+    with buffer_lock:
+        data = list(quat_buffer)
+
+    if len(data) < 2:
+        return None, None
+
+    newest_imu_time = data[-1][0]
+
+    time_array = np.array([item[0] for item in data], dtype=float)
+    quat_array = np.array([item[1] for item in data], dtype=float)
+
+    valid_idx = [0]
+    for i in range(1, len(time_array)):
+        if time_array[i] > time_array[valid_idx[-1]]:
+            valid_idx.append(i)
+
+    if len(valid_idx) < 2:
+        return None, None
+
+    time_array = time_array[valid_idx]
+    quat_array = quat_array[valid_idx]
+
+    if t_query <= time_array[0]:
+        return R.from_quat(quat_array[0]), newest_imu_time
+    if t_query >= time_array[-1]:
+        return R.from_quat(quat_array[-1]), newest_imu_time
+
     rots = R.from_quat(quat_array)
-    slerp_operation = Slerp(time_array, rots)
-    return slerp_operation([t_query])[0]
+    s = Slerp(time_array, rots)
+    return s([t_query])[0], newest_imu_time
 
 
 def main():
-    ser = serial.Serial(PORT, BAUD, timeout=1.0/75.0)
+    ser = serial.Serial(PORT, BAUD, timeout=1.0 / 200.0)
     time.sleep(0.5)
     ser.reset_input_buffer()
     time.sleep(0.5)
@@ -88,97 +214,175 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_WIDTH, res_w)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, res_h)
 
-    hfov_deg = 50
-    fx = 0.5 * res_w / math.tan(math.radians(hfov_deg) / 2)
+    hfov_deg = 50.0
+    fx = 0.5 * res_w / math.tan(math.radians(hfov_deg) / 2.0)
     fy = fx
-    cx = res_w / 2
-    cy = res_h / 2
-    K = np.array([[fx, 0, cx],
-                  [0, fy, cy],
-                  [0,  0,  1]], dtype=float)
-    Kinv = np.linalg.inv(K)   
+    cx = res_w / 2.0
+    cy = res_h / 2.0
 
-    R_ref_flu = None
+    K = np.array([
+        [fx, 0.0, cx],
+        [0.0, fy, cy],
+        [0.0, 0.0, 1.0]
+    ], dtype=float)
+    Kinv = np.linalg.inv(K)
 
-    arduino_thread = threading.Thread(target=read_arduino_serial, args=(ser,), daemon=True)
+    # Same FLU -> CV convention as the C++ code
+    R_flu_to_cv = np.array([
+        [0.0, -1.0,  0.0],
+        [0.0,  0.0, -1.0],
+        [1.0,  0.0,  0.0]
+    ], dtype=float)
+
+    arduino_thread = threading.Thread(
+        target=read_arduino_serial,
+        args=(ser,),
+        daemon=True
+    )
     arduino_thread.start()
 
-    frame_buffer_to_display = None
-    first_iter = True
+    R_stab_filt = R.identity()
 
-    u = np.array([0.0, 0.0, 1.0])
+    loop_fps_smoothed = 0.0
+    warp_ms_smoothed = 0.0
+    imu_interp_ms_smoothed = 0.0
+    last_print_s = time.perf_counter()
 
-    R_flu_to_cv = np.array([[0, -1,  0],
-                            [0,  0, -1],
-                            [1,  0,  0]], dtype=float)
+    def smooth_update(s, x, alpha=0.1):
+        if s <= 0.0:
+            return x
+        return (1.0 - alpha) * s + alpha * x
 
     try:
         while True:
+            loop_t0 = time.perf_counter()
+
             ok, frame = cap.read()
             if not ok:
                 break
 
             t_now = time.perf_counter()
-            t_frame = t_now
-            frame_buffer.append([t_frame, frame])
+            frame_buffer.append((t_now, frame))
 
-            t_target = t_now - video_delay_s
+            t_target = t_now - VIDEO_DELAY_S
+            have_frame = False
+            frame_to_display = None
 
-            if first_iter and len(quat_buffer) >= 2:
-                R_ref_flu = get_quat_at_query_time(t_target)
-                first_iter = False
-
-            # Pop frames up to the target time
             while frame_buffer and frame_buffer[0][0] <= t_target:
-                frame_buffer_to_display = frame_buffer.popleft()
+                frame_to_display = frame_buffer.popleft()
+                have_frame = True
 
-            if (frame_buffer_to_display is not None) and (not first_iter) and len(quat_buffer) >= 2:
-                display_frame_time = frame_buffer_to_display[0]
-                display_frame = frame_buffer_to_display[1]
+            if not have_frame:
+                if cv.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
-                R_cur_flu = get_quat_at_query_time(display_frame_time)
-                
-                euler_angs_deg = R_cur_flu.as_euler("zyx", degrees=True)
+            display_frame_time, display_frame = frame_to_display
 
-                R_rel = R_ref_flu * R_cur_flu.inv()
+            imu_t0 = time.perf_counter()
+            R_cur_flu, newest_imu_time = get_quat_at_query_time(display_frame_time)
+            imu_t1 = time.perf_counter()
 
-                v = R_rel.apply(u)
-                R_tilt, _ = R.align_vectors([u], [v])   # maps v -> u
-                R_stab_flu = R_tilt
+            if R_cur_flu is None:
+                cv.imshow("stabilized_horizon_lock", display_frame)
+                if cv.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
-                R_stab_cv = R_flu_to_cv @ R_stab_flu.as_matrix() @ R_flu_to_cv.T
-                H = K @ R_stab_cv @ Kinv
+            imu_interp_ms = (imu_t1 - imu_t0) * 1000.0
+            imu_interp_ms_smoothed = smooth_update(imu_interp_ms_smoothed, imu_interp_ms)
 
-                warped_frame = cv.warpPerspective(
-                    display_frame, H, (res_w, res_h),
+            # -----------------------------------------------------------------
+            # Horizon-lock logic matched to the C++ file:
+            #
+            # up_world = [0,0,1]
+            # up_body  = R_cur_flu.conjugate() * up_world
+            # up_cam   = normalize(R_flu_to_cv * up_body)
+            # img_up_cam = [0,-1,0]
+            # R_stab_target_cv = rotation_align_a_to_b(up_cam, img_up_cam)
+            # R_stab_filt = slerp_two(R_stab_filt, R_stab_target_cv, alpha)
+            # H = K * Rcv * K^-1
+            # -----------------------------------------------------------------
+            up_world = np.array([0.0, 0.0, 1.0], dtype=float)
+
+            # Equivalent to Eigen quaternion conjugate acting on vector
+            up_body = R_cur_flu.inv().apply(up_world)
+            up_cam = normalize_vec(R_flu_to_cv @ up_body)
+
+            img_up_cam = np.array([0.0, -1.0, 0.0], dtype=float)
+
+            R_stab_target_cv = rotation_align_a_to_b(up_cam, img_up_cam)
+            R_stab_filt = slerp_two(R_stab_filt, R_stab_target_cv, ROT_SMOOTH_ALPHA)
+
+            Rcv = R_stab_filt.as_matrix()
+            H = K @ Rcv @ Kinv
+
+            warp_t0 = time.perf_counter()
+            if not homography_is_safe(H, res_w, res_h):
+                warped = display_frame.copy()
+            else:
+                warped = cv.warpPerspective(
+                    display_frame,
+                    H,
+                    (res_w, res_h),
                     flags=cv.INTER_LINEAR,
                     borderMode=cv.BORDER_REPLICATE
                 )
+            warp_t1 = time.perf_counter()
 
-                side_by_side = np.hstack((display_frame, warped_frame))
+            warp_ms = (warp_t1 - warp_t0) * 1000.0
+            warp_ms_smoothed = smooth_update(warp_ms_smoothed, warp_ms)
 
-                cv.putText(side_by_side, "Original", (20, 40),
-                           cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv.putText(side_by_side, "Roll/Pitch Stabilized", (res_w + 20, 40),
-                           cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv.putText(side_by_side, f"roll: {euler_angs_deg[2]: .2f} [deg]", (20, 90),
-                           cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv.putText(side_by_side, f"pitch: {euler_angs_deg[1]: .2f} [deg]", (20, 140),
-                           cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                cv.putText(side_by_side, f"yaw: {euler_angs_deg[0]: .2f} [deg]", (20, 190),
-                           cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-                
+            loop_t1 = time.perf_counter()
+            loop_ms = (loop_t1 - loop_t0) * 1000.0
+            loop_fps = 1000.0 / loop_ms if loop_ms > 1e-6 else 0.0
+            loop_fps_smoothed = smooth_update(loop_fps_smoothed, loop_fps)
 
-                cv.imshow("Original | Warped", side_by_side)
+            frame_delay_ms = (t_now - display_frame_time) * 1000.0
+            imu_age_ms = (t_now - newest_imu_time) * 1000.0 if newest_imu_time is not None else -1.0
 
-            if cv.waitKey(1) & 0xFF == ord("q"):
-                break
+            euler_angs_deg = R_cur_flu.as_euler("zyx", degrees=True)
+            yaw_deg = euler_angs_deg[0]
+            pitch_deg = euler_angs_deg[1]
+            roll_deg = euler_angs_deg[2]
+
+            if time.perf_counter() - last_print_s >= 1.0:
+                with buffer_lock:
+                    imu_buf_sz = len(quat_buffer)
+
+                print(
+                    f"[CUR] yaw={yaw_deg:.2f} pitch={pitch_deg:.2f} roll={roll_deg:.2f} deg"
+                    f"  [frame_delay] {frame_delay_ms:.2f} ms"
+                    f"  [imu_age] {imu_age_ms:.2f} ms"
+                    f"  [loop_fps] {loop_fps_smoothed:.1f}"
+                    f"  [imu_interp] {imu_interp_ms_smoothed:.2f} ms"
+                    f"  [warp] {warp_ms_smoothed:.1f} ms"
+                    f"  [imu_buf] {imu_buf_sz}"
+                    f"  [frame_buf] {len(frame_buffer)}"
+                )
+                last_print_s = time.perf_counter()
+
+            if SHOW_PREVIEW:
+                cv.putText(warped, f"Loop FPS: {loop_fps_smoothed:.1f}",
+                           (20, 30), cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv.putText(warped, f"Warp: {warp_ms_smoothed:.1f} ms",
+                           (20, 60), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv.putText(warped, f"Delay: {frame_delay_ms:.1f} ms",
+                           (20, 90), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv.putText(warped, f"IMU age: {imu_age_ms:.1f} ms",
+                           (20, 120), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+                cv.imshow("stabilized_horizon_lock", warped)
+                key = cv.waitKey(1)
+                if key == ord("q") or key == 27:
+                    break
 
     finally:
         stop_threads_flag.set()
         cap.release()
         ser.close()
         cv.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

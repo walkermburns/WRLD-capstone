@@ -1,17 +1,38 @@
 #!/usr/bin/env python3
 """
-gst_warp_imu.py (Euler roll/pitch stabilization + latency compensation + filtered IMU prediction)
-FRAME-LOCKED uniforms (cv2-like)
+gst_warp_imu_timing_proof.py
 
-Key change:
-- Instead of applying uniforms on a timer (which can drift relative to buffers),
-  we schedule a main-thread uniform update immediately from the pad probe using GLib.idle_add.
-- To avoid flooding the main loop, we coalesce updates: if one is already scheduled, we just
-  replace the pending Hinv with the latest one.
+Proof-of-concept for the original shader timing issue.
 
-Folder assumption:
-  This file:   vid_stab/python/gst_warp_imu.py
-  Shader:      vid_stab/shaders/warp.frag
+This script intentionally keeps the architecture similar to the original project:
+- live GStreamer video pipeline
+- glshader doing the warp
+- IMU arriving asynchronously on a serial thread
+- homography computed from IMU using frame timestamps
+
+Two apply modes:
+1) idle_coalesced
+   - mimics the old gst_warp_imu.py behavior
+   - probe computes Hinv, but uniform application is deferred onto the GLib main thread
+   - if multiple buffers arrive before the apply callback runs, intermediate Hinv values are overwritten
+
+2) probe_direct
+   - same live shader pipeline
+   - same probe timing
+   - but uniform application happens immediately in the probe for that buffer
+
+If probe_direct reduces jitter relative to idle_coalesced, the likely issue in the
+original project is shader-uniform timing/coalescing rather than the stabilization math.
+
+Controls:
+    q      quit
+    m      toggle apply mode
+    [ ]    decrease/increase ROT_SMOOTH_ALPHA
+    - =    decrease/increase COMPENSATE_FRAC
+    p      toggle console prints
+
+Expected IMU serial format:
+    sample_idx,mcu_time_us,qw,qx,qy,qz
 """
 
 import sys
@@ -39,7 +60,7 @@ from gi.repository import Gst, GLib
 PORT = "/dev/ttyUSB0"
 BAUD = 460800
 
-ARDUINO_PRINT_HZ = 100
+IMU_RATE_HZ_EST = 100
 BUFFER_TIME_S = 6.0
 
 RES_W, RES_H = 640, 480
@@ -50,23 +71,18 @@ USE_QUAT_CONJUGATE = False
 GAIN = 1.0
 MAX_TILT_RAD = math.radians(180.0)
 
-# 1.0 = no smoothing (most responsive). If standstill shimmer: 0.85
 ROT_SMOOTH_ALPHA = 1.0
-
-# Extra manual lead after latency compensation (usually 0.0)
 IMU_LEAD_S = 0.0
-
-CAPTURE_INITIAL_TILT_REF = False
-
 PREDICT_MAX_S = 0.12
-
-# With display_age ~68ms, start at 0.7 for less jitter; 1.0 is most aggressive
 COMPENSATE_FRAC = 1.0
 
 OMEGA_ALPHA = 0.25
 OMEGA_CLAMP = 25.0
 
 PRINT_EVERY_S = 1.0
+
+APPLY_MODE = "idle_coalesced"   # "idle_coalesced" or "probe_direct"
+PAUSE_PRINT = False
 
 PIPELINE_DESC = f"""
 v4l2src device=/dev/video0 io-mode=2 !
@@ -83,28 +99,48 @@ glimagesink name=vsink sync=false
 # -----------------------------
 # IMU buffer (perf_counter time base)
 # -----------------------------
-quat_buffer = deque(maxlen=int(BUFFER_TIME_S * ARDUINO_PRINT_HZ))  # (t_perf, [x,y,z,w])
+quat_buffer = deque(maxlen=int(BUFFER_TIME_S * IMU_RATE_HZ_EST))  # (t_perf, [x,y,z,w])
 buf_lock = threading.Lock()
 stop_flag = threading.Event()
 
 
 def parse_imu_line(line: str):
+    """
+    Expected compact format:
+        sample_idx,mcu_time_us,qw,qx,qy,qz
+    Returns scipy-order quaternion [x,y,z,w].
+    """
     parts = line.split(",")
-    if len(parts) < 7:
+    if len(parts) < 6:
         raise ValueError("Not enough fields")
 
-    w = float(parts[3])
-    x = float(parts[4])
-    y = float(parts[5])
-    z = float(parts[6])
+    _sample_idx = int(parts[0])
+    _mcu_time_us = int(parts[1])
+
+    w = float(parts[2])
+    x = float(parts[3])
+    y = float(parts[4])
+    z = float(parts[5])
 
     if USE_QUAT_CONJUGATE:
         x, y, z = -x, -y, -z
 
-    return [x, y, z, w]
+    q = np.array([x, y, z, w], dtype=float)
+    n = np.linalg.norm(q)
+    if n < 1e-12:
+        raise ValueError("Degenerate quaternion")
+    return q / n
 
 
 def imu_thread_fn():
+    """
+    Serial thread:
+    - parse quaternions
+    - host-timestamp them
+    - enforce quaternion sign continuity to make interpolation/debugging stable
+    """
+    last_q = None
+
     ser = serial.Serial(PORT, BAUD, timeout=1.0 / 75.0)
     time.sleep(0.5)
     ser.reset_input_buffer()
@@ -115,7 +151,13 @@ def imu_thread_fn():
             line = ser.read_until().decode("utf-8", errors="replace").strip()
             if not line:
                 continue
+
             q_xyzw = parse_imu_line(line)
+
+            if last_q is not None and np.dot(last_q, q_xyzw) < 0.0:
+                q_xyzw = -q_xyzw
+            last_q = q_xyzw
+
             t = time.perf_counter()
             with buf_lock:
                 quat_buffer.append((t, q_xyzw))
@@ -202,6 +244,8 @@ def homography_is_safe(Hinv: np.ndarray, w: int, h: int) -> bool:
         return False
 
     uv = (q[:2, :] / z).T
+    if np.any(~np.isfinite(uv)):
+        return False
     if np.any(np.abs(uv) > 5.0 * max(w, h)):
         return False
     return True
@@ -220,6 +264,8 @@ def on_bus_message(bus: Gst.Bus, msg: Gst.Message, loop: GLib.MainLoop):
 
 
 def main():
+    global APPLY_MODE, ROT_SMOOTH_ALPHA, COMPENSATE_FRAC, PAUSE_PRINT
+
     Gst.init(None)
 
     th = threading.Thread(target=imu_thread_fn, daemon=True)
@@ -250,7 +296,11 @@ def main():
         raise RuntimeError("Could not find glimagesink named 'vsink'")
 
     # Load shader
-    shader_path = Path(__file__).resolve().parent.parent / "shaders" / "warp.frag"
+    shader_path = Path(__file__).resolve().parent / "warp.frag"
+    if not shader_path.exists():
+        # fall back to sibling shader folder layout like old project
+        shader_path = Path(__file__).resolve().parent.parent / "shaders" / "warp.frag"
+
     frag_src = shader_path.read_text(encoding="utf-8")
     if len(frag_src) < 50:
         raise RuntimeError(f"Shader looks empty: {shader_path}")
@@ -266,10 +316,6 @@ def main():
     tsync_initialized = False
     offset_perf_minus_running = 0.0
 
-    # Euler reference
-    have_ref = False
-    R_ref_flu = R.identity()
-
     # Correction smoothing
     R_corr_filt = R.identity()
 
@@ -282,6 +328,14 @@ def main():
     last_omega_time = 0.0
 
     last_print = 0.0
+
+    # Stats specifically about coalescing / apply path
+    apply_lock = threading.Lock()
+    pending_Hinv = np.eye(3, dtype=float)
+    apply_scheduled = False
+    coalesced_overwrites = 0
+    applied_callbacks = 0
+    direct_applies = 0
 
     def rot_at_time_with_filtered_prediction(t_query: float) -> R:
         nonlocal omega_filt, last_omega_time
@@ -314,32 +368,29 @@ def main():
         R2 = R.from_quat(q2)
         return R2 * R.from_rotvec(omega_filt * dt_pred)
 
-    # ---------- Frame-locked uniform application (coalesced) ----------
-    apply_lock = threading.Lock()
-    pending_Hinv = np.eye(3, dtype=float)
-    apply_scheduled = False
-
     def _apply_pending_uniforms():
         """
         Runs on GLib main thread.
-        Applies the *latest* pending Hinv (coalesced).
+        Applies the latest pending Hinv (coalesced).
         """
-        nonlocal apply_scheduled, pending_Hinv
+        nonlocal apply_scheduled, pending_Hinv, applied_callbacks
         with apply_lock:
             H = pending_Hinv.copy()
             apply_scheduled = False
 
-        # Set uniforms on main thread (safe)
         glshader.set_property("uniforms", make_uniforms_from_Hinv(H))
-        return False  # run once
+        applied_callbacks += 1
+        return False
 
     def schedule_apply(Hinv: np.ndarray):
         """
         Called from streaming thread (pad probe).
-        Coalesce: only one idle callback at a time; overwrite pending matrix.
+        Coalesce: if one callback is already queued, overwrite the pending matrix.
         """
-        nonlocal apply_scheduled, pending_Hinv
+        nonlocal apply_scheduled, pending_Hinv, coalesced_overwrites
         with apply_lock:
+            if apply_scheduled:
+                coalesced_overwrites += 1
             pending_Hinv = Hinv
             if apply_scheduled:
                 return
@@ -370,7 +421,7 @@ def main():
 
     vsink_pad.add_probe(Gst.PadProbeType.BUFFER, late_probe_cb)
 
-    # Early probe: compute Hinv
+    # Early probe: compute Hinv from the current buffer's PTS
     sinkpad = glshader.get_static_pad("sink")
     if sinkpad is None:
         raise RuntimeError("Could not get glshader sink pad")
@@ -379,10 +430,11 @@ def main():
 
     def probe_cb(pad, info):
         nonlocal tsync_initialized, offset_perf_minus_running
-        nonlocal have_ref, R_ref_flu
         nonlocal R_corr_filt
         nonlocal last_print
         nonlocal last_good_Hinv
+        nonlocal direct_applies
+        global APPLY_MODE
 
         buf = info.get_buffer()
         if buf is None:
@@ -407,38 +459,57 @@ def main():
             return Gst.PadProbeReturn.OK
 
         lat_probe = float(np.clip(max(0.0, rt_now - rt_frame), 0.0, 0.25))
-
         lead_total = COMPENSATE_FRAC * extra_lat_s + IMU_LEAD_S
         t_frame_perf = rt_frame + offset_perf_minus_running + lead_total
 
         with buf_lock:
             if len(quat_buffer) < 20:
-                # identity warp while IMU warms up
-                schedule_apply(np.eye(3, dtype=float))
+                Hinv = np.eye(3, dtype=float)
+                if APPLY_MODE == "probe_direct":
+                    glshader.set_property("uniforms", make_uniforms_from_Hinv(Hinv))
+                    direct_applies += 1
+                else:
+                    schedule_apply(Hinv)
                 return Gst.PadProbeReturn.OK
+
             t_min = quat_buffer[0][0]
 
         if t_frame_perf < t_min:
-            # too old, hold last
-            schedule_apply(last_good_Hinv)
+            Hinv = last_good_Hinv
+            if APPLY_MODE == "probe_direct":
+                glshader.set_property("uniforms", make_uniforms_from_Hinv(Hinv))
+                direct_applies += 1
+            else:
+                schedule_apply(Hinv)
             return Gst.PadProbeReturn.OK
 
         try:
             R_cur_flu = rot_at_time_with_filtered_prediction(t_frame_perf)
         except Exception:
-            schedule_apply(last_good_Hinv)
+            Hinv = last_good_Hinv
+            if APPLY_MODE == "probe_direct":
+                glshader.set_property("uniforms", make_uniforms_from_Hinv(Hinv))
+                direct_applies += 1
+            else:
+                schedule_apply(Hinv)
             return Gst.PadProbeReturn.OK
 
-        now_wall = time.time()
-        if now_wall - last_print >= PRINT_EVERY_S:
-            ypr_cur = R_cur_flu.as_euler("zyx", degrees=True)
-            print(
-                f"[CUR] yaw={ypr_cur[0]: .2f} pitch={ypr_cur[1]: .2f} roll={ypr_cur[2]: .2f} deg\n"
-                f"[lat] probe_age={lat_probe*1000:.1f} ms  display_age={extra_lat_s*1000:.1f} ms  "
-                f"lead_used={lead_total*1000:.1f} ms",
-                flush=True
-            )
-            last_print = now_wall
+        if not PAUSE_PRINT:
+            now_wall = time.time()
+            if now_wall - last_print >= PRINT_EVERY_S:
+                ypr_cur = R_cur_flu.as_euler("zyx", degrees=True)
+                print(
+                    f"[{APPLY_MODE}] "
+                    f"yaw={ypr_cur[0]: .2f} pitch={ypr_cur[1]: .2f} roll={ypr_cur[2]: .2f} deg  "
+                    f"probe_age={lat_probe*1000:.1f} ms  "
+                    f"display_age={extra_lat_s*1000:.1f} ms  "
+                    f"lead_used={lead_total*1000:.1f} ms  "
+                    f"coalesced_overwrites={coalesced_overwrites}  "
+                    f"idle_applies={applied_callbacks}  "
+                    f"direct_applies={direct_applies}",
+                    flush=True
+                )
+                last_print = now_wall
 
         # Pure horizon lock: ignore yaw completely, cancel only absolute pitch/roll
         yaw_cur, pitch_cur, roll_cur = R_cur_flu.as_euler("zyx", degrees=False)
@@ -454,7 +525,7 @@ def main():
         else:
             R_use = R_corr
 
-        # Build homography. Your warp.frag empirically wants inv() here.
+        # Build homography. Your shader expects inverse homography
         R_stab_cv = R_flu_to_cv @ R_use.inv().as_matrix() @ R_flu_to_cv.T
         H = K @ R_stab_cv @ Kinv
 
@@ -468,15 +539,73 @@ def main():
         else:
             last_good_Hinv = Hinv
 
-        # Frame-locked apply (coalesced, main thread)
-        schedule_apply(Hinv)
+        # ---- This is the thing being proven ----
+        if APPLY_MODE == "probe_direct":
+            # Apply immediately for this buffer, keeping the live shader pipeline intact.
+            # This is still the same architecture, but without the deferred/coalesced handoff.
+            try:
+                glshader.set_property("uniforms", make_uniforms_from_Hinv(Hinv))
+                direct_applies += 1
+            except Exception:
+                # fallback if the platform objects to direct probe-thread property update
+                schedule_apply(Hinv)
+        else:
+            # Original-style deferred/coalesced apply
+            schedule_apply(Hinv)
 
         return Gst.PadProbeReturn.OK
 
     sinkpad.add_probe(Gst.PadProbeType.BUFFER, probe_cb)
 
+    # Key polling on main thread
+    def key_tick():
+        global APPLY_MODE, ROT_SMOOTH_ALPHA, COMPENSATE_FRAC, PAUSE_PRINT
+        import select
+
+        # Non-blocking stdin key read
+        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            ch = sys.stdin.read(1)
+            if ch == "q":
+                loop.quit()
+                return False
+            elif ch == "m":
+                APPLY_MODE = "probe_direct" if APPLY_MODE == "idle_coalesced" else "idle_coalesced"
+                print(f"Switched APPLY_MODE to {APPLY_MODE}", flush=True)
+            elif ch == "[":
+                ROT_SMOOTH_ALPHA = max(0.05, ROT_SMOOTH_ALPHA - 0.05)
+                print(f"ROT_SMOOTH_ALPHA = {ROT_SMOOTH_ALPHA:.2f}", flush=True)
+            elif ch == "]":
+                ROT_SMOOTH_ALPHA = min(1.0, ROT_SMOOTH_ALPHA + 0.05)
+                print(f"ROT_SMOOTH_ALPHA = {ROT_SMOOTH_ALPHA:.2f}", flush=True)
+            elif ch == "-":
+                COMPENSATE_FRAC = max(0.0, COMPENSATE_FRAC - 0.1)
+                print(f"COMPENSATE_FRAC = {COMPENSATE_FRAC:.2f}", flush=True)
+            elif ch == "=":
+                COMPENSATE_FRAC = min(1.5, COMPENSATE_FRAC + 0.1)
+                print(f"COMPENSATE_FRAC = {COMPENSATE_FRAC:.2f}", flush=True)
+            elif ch == "p":
+                PAUSE_PRINT = not PAUSE_PRINT
+                print(f"PAUSE_PRINT = {PAUSE_PRINT}", flush=True)
+        return True
+
+    # Need stdin nonblocking-ish for key polling in terminal
+    try:
+        import tty, termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:
+        old_settings = None
+
+    GLib.timeout_add(30, key_tick)
+
     # Start pipeline
     pipe.set_state(Gst.State.PLAYING)
+    print(
+        "Controls: q quit | m toggle apply mode | [ ] alpha | - = compensate_frac | p pause prints",
+        flush=True,
+    )
+
     try:
         loop.run()
     except KeyboardInterrupt:
@@ -484,6 +613,11 @@ def main():
     finally:
         stop_flag.set()
         pipe.set_state(Gst.State.NULL)
+        if old_settings is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
