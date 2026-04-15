@@ -53,7 +53,6 @@ static Quaternion rotvec_to_quat(float rx, float ry, float rz)
     return normalize_quat(q);
 }
 
-// convert a small rotation quaternion to rotation-vector form
 static void quat_to_rotvec(const Quaternion &qin, float &rx, float &ry, float &rz)
 {
     Quaternion q = normalize_quat(qin);
@@ -77,6 +76,54 @@ static void quat_to_rotvec(const Quaternion &qin, float &rx, float &ry, float &r
     rx = q.x * scale;
     ry = q.y * scale;
     rz = q.z * scale;
+}
+
+static float quat_dot_local(const Quaternion &a, const Quaternion &b)
+{
+    return a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static Quaternion quat_slerp(Quaternion a, Quaternion b, float u)
+{
+    a = normalize_quat(a);
+    b = normalize_quat(b);
+
+    float d = quat_dot_local(a, b);
+
+    // shortest-path slerp
+    if (d < 0.0f) {
+        d = -d;
+        b.w = -b.w;
+        b.x = -b.x;
+        b.y = -b.y;
+        b.z = -b.z;
+    }
+
+    u = std::clamp(u, 0.0f, 1.0f);
+
+    // nearly identical: lerp + renormalize
+    if (d > 0.9995f) {
+        Quaternion q;
+        q.w = a.w + u * (b.w - a.w);
+        q.x = a.x + u * (b.x - a.x);
+        q.y = a.y + u * (b.y - a.y);
+        q.z = a.z + u * (b.z - a.z);
+        return normalize_quat(q);
+    }
+
+    d = std::clamp(d, -1.0f, 1.0f);
+    const float theta = std::acos(d);
+    const float s = std::sin(theta);
+
+    Quaternion q;
+    const float wa = std::sin((1.0f - u) * theta) / s;
+    const float wb = std::sin(u * theta) / s;
+
+    q.w = wa * a.w + wb * b.w;
+    q.x = wa * a.x + wb * b.x;
+    q.y = wa * a.y + wb * b.y;
+    q.z = wa * a.z + wb * b.z;
+    return normalize_quat(q);
 }
 
 } // namespace
@@ -319,15 +366,6 @@ void BuoyNode::receiveLoop()
                 for (int i = 0; i < 9; ++i)
                     lastHinv_[i] = Hinv[i];
 
-                // record timestamped matrix; keep only past ~300ms of samples
-                hist_.emplace_back(ts, std::array<float,9>{});
-                for (int i = 0; i < 9; ++i)
-                    hist_.back().second[i] = Hinv[i];
-
-                // drop old entries (older than 300000us)
-                while (!hist_.empty() && ts > hist_.front().first + 300000ull) {
-                    hist_.pop_front();
-                }
             }
         }
 
@@ -386,32 +424,101 @@ bool BuoyNode::getHinvAt(uint64_t timestamp,
 {
     std::lock_guard<std::mutex> lock(quatMutex_);
 
-    if (hist_.empty())
+    if (quat_hist_.size() < 2) {
         return false;
+    }
 
-    uint64_t bestDiff = UINT64_MAX;
-    bool found = false;
+    const uint64_t t_first = quat_hist_.front().first;
+    const uint64_t t_last  = quat_hist_.back().first;
 
-    for (const auto &entry : hist_) {
-        uint64_t t = entry.first;
-        uint64_t diff = (t > timestamp) ? (t - timestamp) : (timestamp - t);
+    if (timestamp + max_interp_gap_us_ < t_first) {
+        if (best_diff_us) {
+            *best_diff_us = t_first - timestamp;
+        }
+        return false;
+    }
 
-        if (diff < bestDiff) {
-            bestDiff = diff;
-            out = entry.second;
-            found = true;
+    Quaternion q_query{};
+
+    if (timestamp <= t_last) {
+        bool bracket_found = false;
+        uint64_t bestDiff = UINT64_MAX;
+
+        for (size_t k = 1; k < quat_hist_.size(); ++k) {
+            const uint64_t ta = quat_hist_[k - 1].first;
+            const uint64_t tb = quat_hist_[k].first;
+
+            uint64_t diff_a = (ta > timestamp) ? (ta - timestamp) : (timestamp - ta);
+            uint64_t diff_b = (tb > timestamp) ? (tb - timestamp) : (timestamp - tb);
+            bestDiff = std::min(bestDiff, std::min(diff_a, diff_b));
+
+            if (ta <= timestamp && timestamp <= tb && tb > ta) {
+                const float u = float(timestamp - ta) / float(tb - ta);
+                q_query = quat_slerp(quat_hist_[k - 1].second, quat_hist_[k].second, u);
+                bracket_found = true;
+                if (best_diff_us) {
+                    *best_diff_us = bestDiff;
+                }
+                break;
+            }
+        }
+
+        if (!bracket_found) {
+            return false;
+        }
+    } else {
+        const uint64_t dt_us = timestamp - t_last;
+        if (dt_us > max_predict_us_) {
+            if (best_diff_us) {
+                *best_diff_us = dt_us;
+            }
+            return false;
+        }
+
+        Quaternion q_last = quat_hist_.back().second;
+        float dt_pred = std::clamp(float(dt_us) * 1e-6f + predict_lead_s_,
+                                   0.0f,
+                                   predict_max_s_);
+
+        Quaternion dq_pred = rotvec_to_quat(omega_filt_[0] * dt_pred,
+                                            omega_filt_[1] * dt_pred,
+                                            omega_filt_[2] * dt_pred);
+        q_query = quat_mult(dq_pred, q_last);
+        q_query = normalize_quat(q_query);
+
+        if (best_diff_us) {
+            *best_diff_us = dt_us;
         }
     }
 
-    if (best_diff_us)
-        *best_diff_us = bestDiff;
+    float Hinv[9];
+    Quaternion quat_ref_local = quat_ref;
+    bool have_ref_local = have_ref;
+    float pitch_filt_local = corr_pitch_filt;
+    float roll_filt_local = corr_roll_filt;
 
-    if (!found)
+    
+
+    bool ok = compute_homography_from_quat(q_query,
+                                           quat_ref_local,
+                                           have_ref_local,
+                                           corr_smooth_alpha,
+                                           pitch_filt_local,
+                                           roll_filt_local,
+                                           Rflu2cv_mat,
+                                           K,
+                                           Kinv,
+                                           cam_w,
+                                           cam_h,
+                                           Hinv,
+                                           nullptr);
+    if (!ok) {
         return false;
+    }
 
-    if (bestDiff > max_hinv_match_diff_us_)
-        return false;
-
+    for (int j = 0; j < 9; ++j) {
+        out[j] = Hinv[j];
+    }
     return true;
 }
 

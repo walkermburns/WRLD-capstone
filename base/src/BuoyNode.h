@@ -102,20 +102,16 @@ private:
     float corr_pitch_filt = 0.0f;
     float corr_roll_filt = 0.0f;
 
-    // history of recent Hinv matrices with associated IMU timestamps
-    // we store roughly 100ms of data at ~100Hz; deque chosen for efficient
-    // push/pop at both ends.
-    std::deque<std::pair<uint64_t,std::array<float,9>>> hist_;
+    // recent quaternion history in sender timestamp domain
+    std::deque<std::pair<uint64_t, MathHelpers::Quaternion>> quat_hist_;
 
-    // reject timestamp matches that are too far away
-    uint64_t max_hinv_match_diff_us_ = 20000;  // 20 ms
+    // interpolation / prediction bounds for query-time homography generation
+    uint64_t max_interp_gap_us_ = 100000;   // 100 ms
+    uint64_t max_predict_us_    = 80000;   // 80 ms
 
     // helper to initialize camera matrices; called from constructors
     void initCameraMatrices();
     void initDebugCsv();
-
-    // recent quaternion history for latency compensation / prediction
-    std::deque<std::pair<uint64_t, MathHelpers::Quaternion>> quat_hist_;
 
     // filtered angular velocity predictor state (rotvec rad/s)
     std::array<float,3> omega_filt_ = {0.0f, 0.0f, 0.0f};
@@ -126,8 +122,8 @@ private:
     uint64_t last_omega_ts_ = 0;
 
     // prediction tuning
-    float predict_lead_s_ = 0.0f;      // 10 ms lead
-    float predict_max_s_  = 0.0f;      // clamp same spirit as python
-    float omega_alpha_    = 0.1f;       // matches python prototype
-    float omega_clamp_    = 2.0f;       // rad/s clamp
+    float predict_lead_s_ = 0.0f;      // keep 0 until sender-time alignment is verified
+    float predict_max_s_  = 0.08f;     // 80 ms max forward prediction
+    float omega_alpha_    = 0.10f;
+    float omega_clamp_    = 25.0f;     // match python prototype scale better
 };

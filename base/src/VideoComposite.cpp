@@ -1,25 +1,25 @@
 #include "VideoComposite.h"
-#include "MathHelpers.h"   // quaternion/matrix math moved out of class
-#include "BuoyNode.h"      // need full definition for getQuaternion
+#include "MathHelpers.h"
+#include "BuoyNode.h"
 
 #include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/gl/gl.h>
-#include <gst/rtp/rtp.h>    // parse RTP headers and extensions
 #include <math.h>
 #include <stdio.h>
 #include <vector>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-#include <iostream>      // for std::cerr
+#include <iostream>
 #include <cstring>
 #include <mutex>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-using namespace MathHelpers; // bring helpers into current namespace
+using namespace MathHelpers;
 
-
-// static member definition
 VideoComposite *VideoComposite::s_instance = nullptr;
 
 struct BranchProbeCtx {
@@ -27,9 +27,7 @@ struct BranchProbeCtx {
     int branch_index = -1;
 };
 
-// bus watch callback used in run_pipeline; reports errors/warnings from
-// elements (GL shader compile issues typically show up here).
-static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer /*user_data*/)
+static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer)
 {
     switch (GST_MESSAGE_TYPE(msg)) {
     case GST_MESSAGE_ERROR: {
@@ -59,44 +57,55 @@ static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer /*user_data*/)
     default:
         break;
     }
-    return TRUE; /* keep bus watch alive */
+    return TRUE;
 }
 
-// NOTE: quaternion/matrix helpers have been moved to MathHelpers.{h,cpp}
-// so we no longer define them here.  VideoComposite.cpp simply includes the
-// header and uses the free functions via namespace MathHelpers.
+#pragma pack(push, 1)
+struct VideoTimestampPacket {
+    uint32_t frame_idx_be;
+    uint64_t timestamp_us_be;
+};
+#pragma pack(pop)
 
-
+static uint64_t ntohll_u64(uint64_t x)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    return (static_cast<uint64_t>(ntohl(static_cast<uint32_t>(x & 0xFFFFFFFFULL))) << 32) |
+           ntohl(static_cast<uint32_t>(x >> 32));
+#else
+    return x;
+#endif
+}
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
-                                   const std::vector<int> &ports)
+                               const std::vector<int> &ports)
     : pipeline(nullptr), mix_element(nullptr), live_k1(0.3f), live_zoom(1.1f),
       live_w(1920.0f), live_h(1080.0f),
       live_h00(1.0f), live_h01(0.0f), live_h02(0.0f),
       live_h10(0.0f), live_h11(1.0f), live_h12(0.0f),
       live_h20(0.0f), live_h21(0.0f), live_h22(1.0f),
-      // default to four incoming UDP streams; we add a separate background
-      // videotestsrc below rather than counting it here.
-      num_src(0), uniforms(nullptr), stab(), branch_active(), quat_(), nodes_(nullptr) {
-    // copy port list and derive source count
+      num_src(0), uniforms(nullptr), stab(), branch_active(), quat_(), nodes_(nullptr)
+{
     video_ports = ports;
     num_src = static_cast<int>(video_ports.size());
     stab.assign(num_src, nullptr);
     branch_active.assign(num_src, false);
-    // frame_pts_to_imu_offset_us_.assign(num_src, 11159520000LL);
     frame_pts_to_imu_offset_us_.assign(num_src, 0LL);
+    sender_ts_queue_us_.assign(num_src, std::deque<FrameMetaEntry>{});
 
-    // frame_ts_queue_us_.assign(num_src, std::deque<uint64_t>{});
+    last_applied_H_.assign(num_src, std::array<float,9>{});
+    last_applied_H_valid_.assign(num_src, false);
+    last_used_frame_ts_us_.assign(num_src, 0ull);
+    metadata_seen_.assign(num_src, false);
+    for (int k = 0; k < num_src; ++k) {
+        for (int j = 0; j < 9; ++j) {
+            last_applied_H_[k][j] = (j % 4 == 0) ? 1.0f : 0.0f;
+        }
+    }
 
-    // (camera matrix initialization is now handled inside BuoyNode; not
-    // needed here)
-
-    // load shader file
     std::ifstream in(shaderPath);
     if (!in) {
         std::string msg = "failed to open shader file '" + shaderPath + "'";
-        // log unconditionally so we see the bad path even if the exception is
-        // accidentally swallowed further up the call chain.
         std::cerr << msg << "\n";
         throw std::runtime_error(msg);
     }
@@ -108,24 +117,6 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
         std::cerr << msg << "\n";
         throw std::runtime_error(msg);
     }
-    /* allocate and clear vector to match num_src; entries beyond
-       num_src are not used */
-    stab.assign(num_src, nullptr);
-
-    // note: nodes_ pointer will be configured by caller afterwards via
-    // setBuoyNodes().  we intentionally do not try to access it here since
-    // main may not have created the nodes vector yet.
-
-    /* prepare the uniforms structure once and reuse it; include every
-       value the shader might reference so that the structure can be updated
-       in one place later.  the matrix defaults correspond to identity. */
-    // start quaternion data as identity rotation
-    float r00 = 1.0f, r01 = 0.0f, r02 = 0.0f;
-    float r10 = 0.0f, r11 = 1.0f, r12 = 0.0f;
-    float r20 = 0.0f, r21 = 0.0f, r22 = 1.0f;
-    float ir00 = r00, ir01 = r10, ir02 = r20;
-    float ir10 = r01, ir11 = r11, ir12 = r21;
-    float ir20 = r02, ir21 = r12, ir22 = r22;
 
     uniforms = gst_structure_new("uniforms",
                                  "k1", G_TYPE_FLOAT, live_k1,
@@ -144,10 +135,11 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
                                  NULL);
 }
 
-VideoComposite::~VideoComposite() {
+VideoComposite::~VideoComposite()
+{
+    stop_metadata_receivers();
     if (pipeline) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
-        /* unref only the entries we actually created */
         for (int i = 0; i < num_src && i < (int)stab.size(); i++) {
             if (stab[i]) gst_object_unref(stab[i]);
         }
@@ -159,11 +151,11 @@ VideoComposite::~VideoComposite() {
     }
 }
 
-void VideoComposite::start() {
+void VideoComposite::start()
+{
     gst_init(nullptr, nullptr);
-
+    start_metadata_receivers();
 #ifdef __APPLE__
-    // store instance in case gst_macos_main fails to forward our user_data
     s_instance = this;
     gst_macos_main((GstMainFunc)VideoComposite::run_pipeline, 0, nullptr, this);
 #else
@@ -171,15 +163,105 @@ void VideoComposite::start() {
 #endif
 }
 
-// setter helpers -----------------------------------------------------------
+void VideoComposite::start_metadata_receivers()
+{
+    if (meta_threads_running_)
+        return;
+    meta_threads_running_ = true;
+    meta_threads_.clear();
+    for (int i = 0; i < num_src; ++i) {
+        const int meta_port = video_ports[i] + 1;
+        meta_threads_.emplace_back(&VideoComposite::metadata_receiver_loop, this, i, meta_port);
+    }
+}
 
-void VideoComposite::setUniforms(float k1,
-                                    float zoom,
-                                    float w,
-                                    float h,
-                                    float h00, float h01, float h02,
-                                    float h10, float h11, float h12,
-                                    float h20, float h21, float h22) {
+void VideoComposite::stop_metadata_receivers()
+{
+    if (!meta_threads_running_)
+        return;
+    meta_threads_running_ = false;
+    for (auto &t : meta_threads_) {
+        if (t.joinable())
+            t.join();
+    }
+    meta_threads_.clear();
+}
+
+void VideoComposite::metadata_receiver_loop(int branch_index, int meta_port)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("metadata socket");
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(meta_port);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+        perror("metadata bind");
+        close(sock);
+        return;
+    }
+
+    g_print("[meta rx %d] listening on UDP %d\n", branch_index, meta_port);
+
+    while (meta_threads_running_) {
+        VideoTimestampPacket pkt{};
+        ssize_t n = recv(sock, &pkt, sizeof(pkt), 0);
+        if (n < 0) {
+            continue;
+        }
+        if (n != (ssize_t)sizeof(pkt)) {
+            continue;
+        }
+
+        FrameMetaEntry stamp{};
+        stamp.frame_idx = ntohl(pkt.frame_idx_be);
+        stamp.timestamp_us = ntohll_u64(pkt.timestamp_us_be);
+
+        {
+            std::lock_guard<std::mutex> lock(sender_ts_mutex_);
+            auto &q = sender_ts_queue_us_[branch_index];
+            q.push_back(stamp);
+            while (q.size() > 64) {
+                q.pop_front();
+            }
+        }
+
+        static thread_local uint64_t dbg_counter = 0;
+        if ((++dbg_counter % 30) == 0) {
+            size_t qsize = 0;
+            {
+                std::lock_guard<std::mutex> lock(sender_ts_mutex_);
+                qsize = sender_ts_queue_us_[branch_index].size();
+            }
+            g_print("[meta rx %d] frame_idx=%" G_GUINT64_FORMAT
+                    " ts_us=%" G_GUINT64_FORMAT " qsize=%zu\n",
+                    branch_index,
+                    stamp.frame_idx,
+                    stamp.timestamp_us,
+                    qsize);
+        }
+    }
+
+    close(sock);
+}
+
+void VideoComposite::setUniforms(float k1, float zoom, float w, float h,
+                                 float h00, float h01, float h02,
+                                 float h10, float h11, float h12,
+                                 float h20, float h21, float h22)
+{
     live_k1 = k1;
     live_zoom = zoom;
     live_w = w;
@@ -187,12 +269,6 @@ void VideoComposite::setUniforms(float k1,
     live_h00 = h00; live_h01 = h01; live_h02 = h02;
     live_h10 = h10; live_h11 = h11; live_h12 = h12;
     live_h20 = h20; live_h21 = h21; live_h22 = h22;
-
-    // the caller provides the inverse-homography entries; just echo them
-    std::cout << "[VideoComposite] homography Hinv:\n"
-              << "  " << h00 << " " << h01 << " " << h02 << "\n"
-              << "  " << h10 << " " << h11 << " " << h12 << "\n"
-              << "  " << h20 << " " << h21 << " " << h22 << "\n";
 
     if (uniforms) {
         gst_structure_set(uniforms,
@@ -210,43 +286,17 @@ void VideoComposite::setUniforms(float k1,
                           "h21", G_TYPE_FLOAT, live_h21,
                           "h22", G_TYPE_FLOAT, live_h22,
                           NULL);
-    } else {
-        uniforms = gst_structure_new("uniforms",
-                                     "k1", G_TYPE_FLOAT, live_k1,
-                                     "zoom", G_TYPE_FLOAT, live_zoom,
-                                     "w", G_TYPE_FLOAT, live_w,
-                                     "h", G_TYPE_FLOAT, live_h,
-                                     "h00", G_TYPE_FLOAT, live_h00,
-                                     "h01", G_TYPE_FLOAT, live_h01,
-                                     "h02", G_TYPE_FLOAT, live_h02,
-                                     "h10", G_TYPE_FLOAT, live_h10,
-                                     "h11", G_TYPE_FLOAT, live_h11,
-                                     "h12", G_TYPE_FLOAT, live_h12,
-                                     "h20", G_TYPE_FLOAT, live_h20,
-                                     "h21", G_TYPE_FLOAT, live_h21,
-                                     "h22", G_TYPE_FLOAT, live_h22,
-                                     NULL);
     }
 }
 
-// called by BuoyNode callback; pulls quaternion components out of the
-// protobuf message, updates our internal copy, and print them so we know the
-// callback is firing.
-void VideoComposite::updateQuaternion(const buoy_proto::IMU_proto &msg) {
-    // this helper is now primarily kept for legacy/testing; most clients
-    // will update quat_ via the nodes_ vector instead of a callback.
+void VideoComposite::updateQuaternion(const buoy_proto::IMU_proto &msg)
+{
     quat_.w = msg.quat_w();
     quat_.x = msg.quat_x();
     quat_.y = msg.quat_y();
     quat_.z = msg.quat_z();
 }
 
-// static callbacks ----------------------------------------------------------
-
-/* pad probe that runs for buffers entering an individual shader branch.
-   It uses the per-branch video sender timestamp to fetch the closest IMU-derived
-   inverse homography from the matching BuoyNode and applies it immediately to
-   that branch's shader. */
 GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                                gpointer user_data)
 {
@@ -268,14 +318,61 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
 
     uint64_t frame_ts_us = 0;
     bool have_frame_ts = false;
-    if (GST_BUFFER_PTS_IS_VALID(buf)) {
-        frame_ts_us = GST_BUFFER_PTS(buf) / 1000;  // ns -> us
-        have_frame_ts = true;
+    bool used_sender_ts = false;
+    bool used_pts_fallback = false;
+    size_t sender_q_size_after_pop = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(self->sender_ts_mutex_);
+        auto &q = self->sender_ts_queue_us_[i];
+
+        if (q.size() >= 2) {
+            while (q.size() > 2) {
+                q.pop_front();
+            }
+            frame_ts_us = q.front().timestamp_us;
+            q.pop_front();
+            have_frame_ts = true;
+            used_sender_ts = true;
+            self->metadata_seen_[i] = true;
+        } else if (q.size() == 1) {
+            frame_ts_us = q.front().timestamp_us;
+            q.pop_front();
+            have_frame_ts = true;
+            used_sender_ts = true;
+            self->metadata_seen_[i] = true;
+        }
+
+        sender_q_size_after_pop = q.size();
+    }
+
+    if (!have_frame_ts) {
+        if (i < (int)self->metadata_seen_.size() &&
+            self->metadata_seen_[i] &&
+            i < (int)self->last_applied_H_valid_.size() &&
+            self->last_applied_H_valid_[i]) {
+            frame_ts_us = 0;
+            have_frame_ts = false;
+            used_pts_fallback = false;
+        } else if (GST_BUFFER_PTS_IS_VALID(buf)) {
+            frame_ts_us = GST_BUFFER_PTS(buf) / 1000;
+            have_frame_ts = true;
+            used_pts_fallback = true;
+        }
     }
 
     int64_t query_ts_us = static_cast<int64_t>(frame_ts_us);
     if (i < (int)self->frame_pts_to_imu_offset_us_.size()) {
         query_ts_us += self->frame_pts_to_imu_offset_us_[i];
+    }
+
+    uint64_t frame_dt_us = 0;
+    if (used_sender_ts && i < (int)self->last_used_frame_ts_us_.size()) {
+        uint64_t &last_ts = self->last_used_frame_ts_us_[i];
+        if (last_ts != 0 && frame_ts_us > last_ts) {
+            frame_dt_us = frame_ts_us - last_ts;
+        }
+        last_ts = frame_ts_us;
     }
 
     int idx = i;
@@ -295,8 +392,20 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
     uint64_t best_diff_us = 0;
     bool got_hinv = false;
     bool used_latest_fallback = false;
+    bool held_due_to_outlier = false;
+    bool reused_last_H_due_to_missing_meta = false;
 
-    if (self->nodes_ && idx < (int)self->nodes_->size()) {
+    if (!used_sender_ts &&
+        i < (int)self->metadata_seen_.size() &&
+        self->metadata_seen_[i] &&
+        i < (int)self->last_applied_H_valid_.size() &&
+        self->last_applied_H_valid_[i]) {
+        H = self->last_applied_H_[i];
+        got_hinv = true;
+        reused_last_H_due_to_missing_meta = true;
+    }
+
+    if (!got_hinv && self->nodes_ && idx < (int)self->nodes_->size()) {
         if (have_frame_ts && query_ts_us >= 0) {
             got_hinv = (*self->nodes_)[idx]->getHinvAt(
                 static_cast<uint64_t>(query_ts_us), H, &best_diff_us);
@@ -309,6 +418,24 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
             got_hinv = true;
             used_latest_fallback = true;
         }
+    }
+
+    if (i < (int)self->last_applied_H_valid_.size() &&
+        self->last_applied_H_valid_[i] &&
+        frame_dt_us > self->frame_dt_outlier_us_) {
+        H = self->last_applied_H_[i];
+        held_due_to_outlier = true;
+    } else if (i < (int)self->last_applied_H_valid_.size() &&
+               self->last_applied_H_valid_[i]) {
+        const float a = self->homography_blend_alpha_;
+        for (int j = 0; j < 9; ++j) {
+            H[j] = (1.0f - a) * self->last_applied_H_[i][j] + a * H[j];
+        }
+    }
+
+    if (i < (int)self->last_applied_H_.size()) {
+        self->last_applied_H_[i] = H;
+        self->last_applied_H_valid_[i] = true;
     }
 
     GstStructure *vars = gst_structure_new("uniforms",
@@ -334,7 +461,6 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
         g_object_set(shader, "uniforms", vars, NULL);
         gst_object_unref(shader);
     }
-
     gst_structure_free(vars);
 
     if (i < (int)self->stab.size() && self->stab[i]) {
@@ -344,15 +470,8 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
                      NULL);
     }
 
-    static uint64_t last_frame_ts_us = 0;
-    uint64_t frame_dt_us = 0;
-    if (last_frame_ts_us != 0 && frame_ts_us > last_frame_ts_us) {
-        frame_dt_us = frame_ts_us - last_frame_ts_us;
-    }
-    last_frame_ts_us = frame_ts_us;
-
     static uint64_t print_counter = 0;
-    if ((++print_counter % 240) == 0) {
+    if ((++print_counter % 50) == 0) {
         int64_t offset_us = 0;
         if (i < (int)self->frame_pts_to_imu_offset_us_.size()) {
             offset_us = self->frame_pts_to_imu_offset_us_[i];
@@ -364,7 +483,12 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
                 " offset_us=%" G_GINT64_FORMAT
                 " best_diff_us=%" G_GUINT64_FORMAT
                 " fallback=%d"
-                " have_frame_ts=%d\n",
+                " hold=%d"
+                " reuse_last=%d"
+                " have_frame_ts=%d"
+                " used_sender_ts=%d"
+                " used_pts_fallback=%d"
+                " sender_q_size=%zu\n",
                 i,
                 frame_ts_us,
                 frame_dt_us,
@@ -372,13 +496,19 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
                 offset_us,
                 best_diff_us,
                 used_latest_fallback ? 1 : 0,
-                have_frame_ts ? 1 : 0);
+                held_due_to_outlier ? 1 : 0,
+                reused_last_H_due_to_missing_meta ? 1 : 0,
+                have_frame_ts ? 1 : 0,
+                used_sender_ts ? 1 : 0,
+                used_pts_fallback ? 1 : 0,
+                sender_q_size_after_pop);
     }
 
     return GST_PAD_PROBE_OK;
 }
 
-void *VideoComposite::run_pipeline(gpointer user_data) {
+void *VideoComposite::run_pipeline(gpointer user_data)
+{
     VideoComposite *self = static_cast<VideoComposite *>(user_data);
     if (!self) {
         self = s_instance;
@@ -427,76 +557,55 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
     layouts.reserve(self->num_src);
     for (int i = 0; i < self->num_src; ++i) {
         SinkLayout l;
-        l.xpos   = i * 1920;
-        l.ypos   = 0;
-        l.width  = 1920;
+        l.xpos = i * 1920;
+        l.ypos = 0;
+        l.width = 1920;
         l.height = 1080;
         layouts.push_back(l);
     }
 
-    gint bg_width  = (self->num_src > 0 ? self->num_src : 1) * 1920;
+    gint bg_width = (self->num_src > 0 ? self->num_src : 1) * 1920;
     gint bg_height = 1080;
 
-    /* --- background branch --- */
     {
-        GstElement *bg_src  = gst_element_factory_make("videotestsrc", "bg_src");
+        GstElement *bg_src = gst_element_factory_make("videotestsrc", "bg_src");
         GstElement *bg_caps = gst_element_factory_make("capsfilter", "bg_caps");
         GstElement *bg_glup = gst_element_factory_make("glupload", "bg_glup");
-
         if (!bg_src || !bg_caps || !bg_glup) {
             g_printerr("run_pipeline: failed to create background elements\n");
             return NULL;
         }
-
         g_object_set(bg_src, "pattern", 0, "is-live", TRUE, NULL);
-
-        GstCaps *bgcaps = gst_caps_from_string(
-            (std::ostringstream() << "video/x-raw,width=" << bg_width
-                                  << ",height=" << bg_height
-                                  << ",framerate=60/1").str().c_str());
+        GstCaps *bgcaps = gst_caps_from_string((std::ostringstream() << "video/x-raw,width="
+                                                                     << bg_width
+                                                                     << ",height="
+                                                                     << bg_height
+                                                                     << ",framerate=60/1").str().c_str());
         g_object_set(bg_caps, "caps", bgcaps, NULL);
         gst_caps_unref(bgcaps);
-
         gst_bin_add_many(GST_BIN(self->pipeline), bg_src, bg_caps, bg_glup, NULL);
         if (!gst_element_link_many(bg_src, bg_caps, bg_glup, NULL)) {
             g_printerr("run_pipeline: failed to link background branch\n");
             return NULL;
         }
-
         GstPad *bg_sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
-        if (!bg_sinkpad) {
-            g_printerr("run_pipeline: could not get mixer pad for background\n");
-            return NULL;
-        }
-
-        g_object_set(bg_sinkpad,
-                     "xpos", 0,
-                     "ypos", 0,
-                     "width", bg_width,
-                     "height", bg_height,
-                     "zorder", 0,
-                     NULL);
-
         GstPad *bg_srcpad = gst_element_get_static_pad(bg_glup, "src");
+        g_object_set(bg_sinkpad, "xpos", 0, "ypos", 0, "width", bg_width, "height", bg_height, "zorder", 0, NULL);
         if (gst_pad_link(bg_srcpad, bg_sinkpad) != GST_PAD_LINK_OK) {
             g_printerr("run_pipeline: failed to link background to mixer\n");
             gst_object_unref(bg_srcpad);
             gst_object_unref(bg_sinkpad);
             return NULL;
         }
-
         gst_object_unref(bg_srcpad);
         gst_object_unref(bg_sinkpad);
     }
 
-    /* --- UDP source branches --- */
     self->stab.assign(self->num_src, nullptr);
 
     for (int i = 0; i < self->num_src; ++i) {
         char udpsrc_nm[32], jitter_nm[32], depay_nm[32], parse_nm[32], dec_nm[32];
-        char conv_nm[32], glup_nm[32], queue_nm[32];
-        char shader_nm[32], stab_nm[32];
-
+        char conv_nm[32], glup_nm[32], queue_nm[32], shader_nm[32], stab_nm[32];
         snprintf(udpsrc_nm, sizeof(udpsrc_nm), "udpsrc%d", i);
         snprintf(jitter_nm, sizeof(jitter_nm), "jitter%d", i);
         snprintf(depay_nm, sizeof(depay_nm), "depay%d", i);
@@ -519,32 +628,21 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         GstElement *stab   = gst_element_factory_make("gltransformation", stab_nm);
         GstElement *queue  = gst_element_factory_make("queue", queue_nm);
 
-        if (!udpsrc || !jitter || !depay || !parse || !dec || !conv ||
-            !glup || !shader || !stab || !queue) {
+        if (!udpsrc || !jitter || !depay || !parse || !dec || !conv || !glup || !shader || !stab || !queue) {
             g_printerr("run_pipeline: failed to create udp branch %d elements\n", i);
             return NULL;
         }
 
         int port = (i < (int)self->video_ports.size() ? self->video_ports[i] : 0);
-        if (port > 0) {
-            g_object_set(udpsrc, "port", port, NULL);
-        } else {
-            g_printerr("run_pipeline: invalid port for branch %d\n", i);
-        }
+        g_object_set(udpsrc, "port", port, NULL);
 
-        GstCaps *rtpcaps = gst_caps_from_string(
-            "application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000");
+        GstCaps *rtpcaps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000");
         g_object_set(udpsrc, "caps", rtpcaps, NULL);
         gst_caps_unref(rtpcaps);
-
         g_object_set(jitter, "latency", 0, "drop-on-latency", TRUE, NULL);
 
-        gst_bin_add_many(GST_BIN(self->pipeline),
-                         udpsrc, jitter, depay, parse, dec,
-                         conv, glup, shader, stab, queue, NULL);
-
-        if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec,
-                                   conv, glup, shader, stab, queue, NULL)) {
+        gst_bin_add_many(GST_BIN(self->pipeline), udpsrc, jitter, depay, parse, dec, conv, glup, shader, stab, queue, NULL);
+        if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec, conv, glup, shader, stab, queue, NULL)) {
             g_printerr("run_pipeline: udp branch %d link failed\n", i);
             return NULL;
         }
@@ -553,12 +651,7 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         self->stab[i] = GST_ELEMENT(gst_object_ref(stab));
 
         GstPad *sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
-        if (!sinkpad) {
-            g_printerr("run_pipeline: could not get mixer pad for branch %d\n", i);
-            return NULL;
-        }
-
-        const SinkLayout &l = layouts[i];
+        const auto &l = layouts[i];
         g_object_set(sinkpad,
                      "xpos", l.xpos,
                      "ypos", l.ypos,
@@ -568,19 +661,12 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
                      NULL);
 
         GstPad *srcpad = gst_element_get_static_pad(queue, "src");
-        if (!srcpad) {
-            g_printerr("run_pipeline: failed to get queue src pad for branch %d\n", i);
-            gst_object_unref(sinkpad);
-            return NULL;
-        }
-
         if (gst_pad_link(srcpad, sinkpad) != GST_PAD_LINK_OK) {
             g_printerr("run_pipeline: failed to link branch %d to mixer\n", i);
             gst_object_unref(srcpad);
             gst_object_unref(sinkpad);
             return NULL;
         }
-
         gst_object_unref(srcpad);
         gst_object_unref(sinkpad);
 
@@ -589,53 +675,39 @@ void *VideoComposite::run_pipeline(gpointer user_data) {
         ctx->branch_index = i;
         probe_ctxs.push_back(ctx);
 
-        {
-            GstPad *imu_pad = gst_element_get_static_pad(glup, "src");
-            if (imu_pad) {
-                gst_pad_add_probe(imu_pad,
-                                  GST_PAD_PROBE_TYPE_BUFFER,
-                                  VideoComposite::imu_probe_cb,
-                                  ctx,
-                                  NULL);
-                gst_object_unref(imu_pad);
-            } else {
-                g_printerr("run_pipeline: failed to get glup src pad for branch %d\n", i);
-            }
+        GstPad *imu_pad = gst_element_get_static_pad(glup, "src");
+        if (imu_pad) {
+            gst_pad_add_probe(imu_pad,
+                              GST_PAD_PROBE_TYPE_BUFFER,
+                              VideoComposite::imu_probe_cb,
+                              ctx,
+                              NULL);
+            gst_object_unref(imu_pad);
         }
     }
 
-    {
-        GstBus *bus = gst_element_get_bus(self->pipeline);
-        gst_bus_add_watch(bus, bus_call, nullptr);
-        gst_object_unref(bus);
-    }
+    GstBus *bus = gst_element_get_bus(self->pipeline);
+    gst_bus_add_watch(bus, bus_call, nullptr);
+    gst_object_unref(bus);
 
     gst_element_set_state(self->pipeline, GST_STATE_PLAYING);
-
     loop = g_main_loop_new(NULL, FALSE);
     g_print("Running base station. Press Ctrl+C to stop.\n");
     g_main_loop_run(loop);
 
     gst_element_set_state(self->pipeline, GST_STATE_NULL);
-
     for (auto *s : self->stab) {
         if (s)
             gst_object_unref(s);
     }
-
     gst_object_unref(self->pipeline);
     g_main_loop_unref(loop);
-
     for (auto *ctx : probe_ctxs)
         delete ctx;
-
     return NULL;
 }
 
-
-// ---------------------------------------------------------------------------
-// new methods
-
-void VideoComposite::setBuoyNodes(std::vector<std::unique_ptr<BuoyNode>> *nodes) {
+void VideoComposite::setBuoyNodes(std::vector<std::unique_ptr<BuoyNode>> *nodes)
+{
     nodes_ = nodes;
 }
