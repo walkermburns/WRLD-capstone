@@ -27,11 +27,13 @@ public:
 
     void setBuoyNodes(std::vector<std::unique_ptr<BuoyNode>> *nodes);
     void start();
+    void stop();
     void updateQuaternion(const buoy_proto::IMU_proto &msg);
 
 private:
     GstElement *pipeline;
     GstElement *mix_element;
+    GMainLoop *main_loop_;
     std::vector<GstElement*> stab;
 
     int num_src;

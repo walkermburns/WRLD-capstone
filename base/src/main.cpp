@@ -69,30 +69,30 @@ int main()
     // provide access to the node list for quaternion polling
     vc.setBuoyNodes(&nodes);
 
-    try {
-        vc.start();
-    } catch (const std::exception &e) {
-        std::cerr << "VideoComposite error: " << e.what() << "\n";
-        return -1;
-    }
-
-    // signal handling to allow clean shutdown.  the handler is intentionally
-    // simple/async-signal-safe: it just flips an atomic flag.  the main loop
-    // notices the change, then tears the nodes down in its own thread context
-    // where it's safe to close sockets, join threads, etc.  the operating
-    // system will also automatically close any file descriptors if the process
-    // is killed, so there's no risk of port leakage even on crashes.
+    // signal handling to allow clean shutdown. the handler only flips an atomic.
     auto sigHandler = [](int){ running = false; };
     std::signal(SIGINT,  sigHandler);
     std::signal(SIGTERM, sigHandler);
-    std::signal(SIGABRT, sigHandler); // in case of abort() the flag is useful
-    std::signal(SIGHUP,  sigHandler); // hangup (e.g. terminal close)
+    std::signal(SIGABRT, sigHandler);
+    std::signal(SIGHUP,  sigHandler);
+
+    std::thread video_thread([&]() {
+        try {
+            vc.start();
+        } catch (const std::exception &e) {
+            std::cerr << "VideoComposite error: " << e.what() << "\n";
+            running = false;
+        }
+    });
 
     while (running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // tear down
+    vc.stop();
+    if (video_thread.joinable())
+        video_thread.join();
+
     for (auto &node : nodes)
         node->stop();
 

@@ -17,6 +17,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <cstdlib>
+#include <ctime>
+#include <iomanip>
 
 using namespace MathHelpers;
 
@@ -76,10 +79,27 @@ static uint64_t ntohll_u64(uint64_t x)
     return x;
 #endif
 }
+static std::string make_default_record_path()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm tm_now{};
+#if defined(_WIN32)
+    localtime_s(&tm_now, &now);
+#else
+    localtime_r(&now, &tm_now);
+#endif
+
+    std::ostringstream oss;
+    oss << "composite_recording_"
+        << std::put_time(&tm_now, "%Y%m%d_%H%M%S")
+        << ".mkv";
+    return oss.str();
+}
+
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                const std::vector<int> &ports)
-    : pipeline(nullptr), mix_element(nullptr), live_k1(0.3f), live_zoom(1.1f),
+    : pipeline(nullptr), mix_element(nullptr), main_loop_(nullptr), live_k1(0.3f), live_zoom(1.1f),
       live_w(1920.0f), live_h(1080.0f),
       live_h00(1.0f), live_h01(0.0f), live_h02(0.0f),
       live_h10(0.0f), live_h11(1.0f), live_h12(0.0f),
@@ -161,6 +181,13 @@ void VideoComposite::start()
 #else
     run_pipeline(this);
 #endif
+}
+
+void VideoComposite::stop()
+{
+    if (main_loop_) {
+        g_main_loop_quit(main_loop_);
+    }
 }
 
 void VideoComposite::start_metadata_receivers()
@@ -520,7 +547,6 @@ void *VideoComposite::run_pipeline(gpointer user_data)
 
     g_print("run_pipeline: self=%p\n", (void*)self);
 
-    GMainLoop *loop = nullptr;
     std::vector<BranchProbeCtx*> probe_ctxs;
 
     self->pipeline = gst_pipeline_new("video_pipeline");
@@ -531,13 +557,31 @@ void *VideoComposite::run_pipeline(gpointer user_data)
 
     GstElement *mix = gst_element_factory_make("glvideomixer", "mix");
     GstElement *convert = gst_element_factory_make("glcolorconvert", "conv");
+    GstElement *tee = gst_element_factory_make("tee", "out_tee");
+
+    GstElement *display_queue = gst_element_factory_make("queue", "display_queue");
     GstElement *fps = gst_element_factory_make("fpsdisplaysink", "fps");
     GstElement *videosink = gst_element_factory_make("glimagesink", "vsink");
 
-    if (!mix || !convert || !fps || !videosink) {
+    GstElement *record_queue = gst_element_factory_make("queue", "record_queue");
+    GstElement *download = gst_element_factory_make("gldownload", "record_gldownload");
+    GstElement *record_convert = gst_element_factory_make("videoconvert", "record_convert");
+    GstElement *enc = gst_element_factory_make("x264enc", "record_enc");
+    GstElement *parse = gst_element_factory_make("h264parse", "record_parse_out");
+    GstElement *mux = gst_element_factory_make("matroskamux", "record_mux");
+    GstElement *sink = gst_element_factory_make("filesink", "record_sink");
+
+    if (!mix || !convert || !tee || !display_queue || !fps || !videosink ||
+        !record_queue || !download || !record_convert || !enc || !parse || !mux || !sink) {
         g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
     }
+
+    const char *record_path_env = std::getenv("GST_RECORD_PATH");
+    std::string default_record_path = make_default_record_path();
+    const char *record_path = (record_path_env && record_path_env[0] != '\0')
+                                ? record_path_env
+                                : default_record_path.c_str();
 
     g_object_set(mix, "background", 1, NULL);
     g_object_set(fps,
@@ -545,12 +589,79 @@ void *VideoComposite::run_pipeline(gpointer user_data)
                  "text-overlay", TRUE,
                  "sync", FALSE,
                  NULL);
+    g_object_set(enc,
+                 "tune", 0x00000004,
+                 "speed-preset", 1,
+                 "bitrate", 10000,
+                 NULL);
+    g_object_set(mux,
+                 "streamable", FALSE,
+                 NULL);
+    g_object_set(sink,
+                 "location", record_path,
+                 "sync", FALSE,
+                 "async", FALSE,
+                 NULL);
 
-    gst_bin_add_many(GST_BIN(self->pipeline), mix, convert, fps, NULL);
-    if (!gst_element_link_many(mix, convert, fps, NULL)) {
-        g_printerr("run_pipeline: failed to link core elements\n");
+    gst_bin_add_many(GST_BIN(self->pipeline),
+                     mix, convert, tee,
+                     display_queue, fps,
+                     record_queue, download, record_convert, enc, parse, mux, sink,
+                     NULL);
+
+    if (!gst_element_link_many(mix, convert, tee, NULL)) {
+        g_printerr("run_pipeline: failed to link core trunk\n");
         return NULL;
     }
+
+    if (!gst_element_link_many(display_queue, fps, NULL)) {
+        g_printerr("run_pipeline: failed to link display branch\n");
+        return NULL;
+    }
+
+    if (!gst_element_link_many(record_queue, download, record_convert, enc, parse, mux, sink, NULL)) {
+        g_printerr("run_pipeline: failed to link record branch\n");
+        return NULL;
+    }
+
+    GstPad *tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
+    GstPad *display_sink_pad = gst_element_get_static_pad(display_queue, "sink");
+    GstPad *tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
+    GstPad *record_sink_pad = gst_element_get_static_pad(record_queue, "sink");
+
+    if (!tee_display_pad || !display_sink_pad || !tee_record_pad || !record_sink_pad) {
+        g_printerr("run_pipeline: failed to get tee/request pads\n");
+        if (tee_display_pad) gst_object_unref(tee_display_pad);
+        if (display_sink_pad) gst_object_unref(display_sink_pad);
+        if (tee_record_pad) gst_object_unref(tee_record_pad);
+        if (record_sink_pad) gst_object_unref(record_sink_pad);
+        return NULL;
+    }
+
+    if (gst_pad_link(tee_display_pad, display_sink_pad) != GST_PAD_LINK_OK) {
+        g_printerr("run_pipeline: failed to link tee to display branch\n");
+        gst_object_unref(tee_display_pad);
+        gst_object_unref(display_sink_pad);
+        gst_object_unref(tee_record_pad);
+        gst_object_unref(record_sink_pad);
+        return NULL;
+    }
+
+    if (gst_pad_link(tee_record_pad, record_sink_pad) != GST_PAD_LINK_OK) {
+        g_printerr("run_pipeline: failed to link tee to record branch\n");
+        gst_object_unref(tee_display_pad);
+        gst_object_unref(display_sink_pad);
+        gst_object_unref(tee_record_pad);
+        gst_object_unref(record_sink_pad);
+        return NULL;
+    }
+
+    gst_object_unref(tee_display_pad);
+    gst_object_unref(display_sink_pad);
+    gst_object_unref(tee_record_pad);
+    gst_object_unref(record_sink_pad);
+
+    g_print("Recording composite output to: %s\n", record_path);
 
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
@@ -691,17 +802,52 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     gst_object_unref(bus);
 
     gst_element_set_state(self->pipeline, GST_STATE_PLAYING);
-    loop = g_main_loop_new(NULL, FALSE);
+    self->main_loop_ = g_main_loop_new(NULL, FALSE);
     g_print("Running base station. Press Ctrl+C to stop.\n");
-    g_main_loop_run(loop);
+    g_main_loop_run(self->main_loop_);
+
+    GstBus *shutdown_bus = gst_element_get_bus(self->pipeline);
+    gst_element_send_event(self->pipeline, gst_event_new_eos());
+
+    GstMessage *shutdown_msg = gst_bus_timed_pop_filtered(
+        shutdown_bus,
+        5 * GST_SECOND,
+        static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+
+    if (!shutdown_msg) {
+        g_printerr("run_pipeline: timed out waiting for EOS during shutdown; finalizing file may be incomplete\n");
+    } else {
+        if (GST_MESSAGE_TYPE(shutdown_msg) == GST_MESSAGE_ERROR) {
+            GError *err = nullptr;
+            gchar *dbg = nullptr;
+            gst_message_parse_error(shutdown_msg, &err, &dbg);
+            g_printerr("run_pipeline: shutdown error from %s: %s\n",
+                       GST_OBJECT_NAME(shutdown_msg->src),
+                       err ? err->message : "unknown error");
+            if (dbg) {
+                g_printerr("run_pipeline: shutdown debug info: %s\n", dbg);
+                g_free(dbg);
+            }
+            if (err) {
+                g_error_free(err);
+            }
+        }
+        gst_message_unref(shutdown_msg);
+    }
+    gst_object_unref(shutdown_bus);
 
     gst_element_set_state(self->pipeline, GST_STATE_NULL);
+    gst_element_get_state(self->pipeline, NULL, NULL, 2 * GST_SECOND);
     for (auto *s : self->stab) {
         if (s)
             gst_object_unref(s);
     }
     gst_object_unref(self->pipeline);
-    g_main_loop_unref(loop);
+    self->pipeline = nullptr;
+    if (self->main_loop_) {
+        g_main_loop_unref(self->main_loop_);
+        self->main_loop_ = nullptr;
+    }
     for (auto *ctx : probe_ctxs)
         delete ctx;
     return NULL;
