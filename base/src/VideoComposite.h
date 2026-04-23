@@ -5,6 +5,8 @@
 #include <gst/gl/gl.h>
 #include "buoy.pb.h"
 #include "MathHelpers.h"
+#include <opencv2/core.hpp>
+#include <opencv2/highgui.hpp>
 #include <string>
 #include <vector>
 #include <array>
@@ -14,6 +16,10 @@
 #include <memory>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
+
+typedef struct _GstAppSink GstAppSink;
 
 class BuoyNode;
 
@@ -55,11 +61,22 @@ private:
     float live_h10, live_h11, live_h12;
     float live_h20, live_h21, live_h22;
 
+    struct DetectionBox {
+        int x = 0;
+        int y = 0;
+        int w = 0;
+        int h = 0;
+        double score = 0.0;
+    };
+
     static gboolean on_draw_signal(GstElement *glfilter, GstGLShader *shader,
                                    guint texture, guint width, guint height,
                                    gpointer user_data);
     static GstPadProbeReturn imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
                                           gpointer user_data);
+    static GstFlowReturn detector_new_sample_cb(GstAppSink *sink,
+                                                gpointer user_data);
+    static gboolean detector_preview_tick_cb(gpointer user_data);
 
     static void *run_pipeline(gpointer user_data);
     static VideoComposite *s_instance;
@@ -96,6 +113,38 @@ private:
 
     uint64_t frame_dt_outlier_us_ = 60000;
     float homography_blend_alpha_ = 1.0f;
+
+    // Detection side branch. No live-display overlay so timing stays close to the original path.
+    bool person_detection_enabled_ = false;
+    int detector_width_ = 320;
+    int detector_height_ = 320;
+    int detector_period_ms_ = 500;
+    bool detector_preview_enabled_ = true;
+    bool detector_preview_window_created_ = false;
+    std::string detector_preview_window_name_ = "Person Detection Debug";
+    guint detector_preview_timer_id_ = 0;
+    std::atomic<bool> stop_requested_{false};
+
+    std::thread detector_thread_;
+    std::atomic<bool> detector_thread_running_{false};
+    std::condition_variable detector_cv_;
+    std::mutex detector_frame_mutex_;
+    cv::Mat detector_latest_frame_;
+    bool detector_have_new_frame_ = false;
+    std::chrono::steady_clock::time_point detector_last_run_tp_{};
+
+    std::vector<DetectionBox> latest_composite_boxes_;
+    std::chrono::steady_clock::time_point latest_composite_detection_tp_{};
+    std::mutex detection_mutex_;
+
+    std::mutex detector_preview_mutex_;
+    cv::Mat detector_preview_frame_;
+    bool detector_preview_frame_ready_ = false;
+
+    void startDetectorThread();
+    void stopDetectorThread();
+    void detectorWorkerLoop();
+    std::vector<DetectionBox> runHogPersonDetector(const cv::Mat &bgr);
 };
 
 #endif // VIDEOCOMPOSITE_H

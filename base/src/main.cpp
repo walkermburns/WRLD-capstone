@@ -3,8 +3,11 @@
 #include <memory>
 #include <atomic>
 #include <csignal>
+#include <signal.h>
 #include <chrono>
 #include <thread>
+#include <cerrno>
+#include <ctime>
 
 #include "Config.h"
 #include "BuoyNode.h"
@@ -69,12 +72,16 @@ int main()
     // provide access to the node list for quaternion polling
     vc.setBuoyNodes(&nodes);
 
-    // signal handling to allow clean shutdown. the handler only flips an atomic.
-    auto sigHandler = [](int){ running = false; };
-    std::signal(SIGINT,  sigHandler);
-    std::signal(SIGTERM, sigHandler);
-    std::signal(SIGABRT, sigHandler);
-    std::signal(SIGHUP,  sigHandler);
+    // Block termination signals in this thread before creating worker threads.
+    // We will synchronously wait for them below with sigtimedwait(), which is
+    // more reliable than trying to unwind GStreamer from an async signal handler.
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGINT);
+    sigaddset(&sigset, SIGTERM);
+    sigaddset(&sigset, SIGABRT);
+    sigaddset(&sigset, SIGHUP);
+    pthread_sigmask(SIG_BLOCK, &sigset, nullptr);
 
     std::thread video_thread([&]() {
         try {
@@ -86,7 +93,16 @@ int main()
     });
 
     while (running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        timespec timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 100 * 1000 * 1000; // 100 ms
+
+        int sig = sigtimedwait(&sigset, nullptr, &timeout);
+        if (sig == SIGINT || sig == SIGTERM || sig == SIGABRT || sig == SIGHUP) {
+            std::cout << "[main] received signal " << sig << ", shutting down\n";
+            running = false;
+            break;
+        }
     }
 
     vc.stop();

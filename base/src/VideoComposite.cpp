@@ -5,6 +5,11 @@
 #include <gst/gst.h>
 #include <gst/video/video.h>
 #include <gst/gl/gl.h>
+#include <gst/app/gstappsink.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/objdetect.hpp>
+#include <opencv2/highgui.hpp>
 #include <math.h>
 #include <stdio.h>
 #include <vector>
@@ -28,6 +33,10 @@ VideoComposite *VideoComposite::s_instance = nullptr;
 struct BranchProbeCtx {
     VideoComposite *self = nullptr;
     int branch_index = -1;
+};
+
+struct DetectorSinkCtx {
+    VideoComposite *self = nullptr;
 };
 
 static gboolean bus_call(GstBus *bus, GstMessage *msg, gpointer)
@@ -79,6 +88,7 @@ static uint64_t ntohll_u64(uint64_t x)
     return x;
 #endif
 }
+
 static std::string make_default_record_path()
 {
     std::time_t now = std::time(nullptr);
@@ -95,7 +105,6 @@ static std::string make_default_record_path()
         << ".mkv";
     return oss.str();
 }
-
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                const std::vector<int> &ports)
@@ -121,6 +130,22 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
         for (int j = 0; j < 9; ++j) {
             last_applied_H_[k][j] = (j % 4 == 0) ? 1.0f : 0.0f;
         }
+    }
+
+    if (const char *det_env = std::getenv("ENABLE_PERSON_DETECTION")) {
+        person_detection_enabled_ = std::atoi(det_env) != 0;
+    }
+    if (const char *w_env = std::getenv("PERSON_DET_WIDTH")) {
+        detector_width_ = std::max(64, std::atoi(w_env));
+    }
+    if (const char *h_env = std::getenv("PERSON_DET_HEIGHT")) {
+        detector_height_ = std::max(64, std::atoi(h_env));
+    }
+    if (const char *p_env = std::getenv("PERSON_DET_PERIOD_MS")) {
+        detector_period_ms_ = std::max(1, std::atoi(p_env));
+    }
+    if (const char *prev_env = std::getenv("SHOW_PERSON_DET_PREVIEW")) {
+        detector_preview_enabled_ = std::atoi(prev_env) != 0;
     }
 
     std::ifstream in(shaderPath);
@@ -157,6 +182,8 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
 
 VideoComposite::~VideoComposite()
 {
+    stop_requested_ = true;
+    stopDetectorThread();
     stop_metadata_receivers();
     if (pipeline) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
@@ -169,10 +196,58 @@ VideoComposite::~VideoComposite()
         gst_structure_free(uniforms);
         uniforms = nullptr;
     }
+
+    if (detector_preview_timer_id_ != 0) {
+        g_source_remove(detector_preview_timer_id_);
+        detector_preview_timer_id_ = 0;
+    }
+
+    if (detector_preview_enabled_ && detector_preview_window_created_) {
+        try {
+            cv::destroyWindow(detector_preview_window_name_);
+            cv::waitKey(1);
+        } catch (...) {
+        }
+        detector_preview_window_created_ = false;
+    }
 }
 
+
+
+gboolean VideoComposite::detector_preview_tick_cb(gpointer user_data)
+{
+    auto *self = static_cast<VideoComposite *>(user_data);
+    if (!self || !self->detector_preview_enabled_)
+        return G_SOURCE_CONTINUE;
+
+    cv::Mat frame;
+    {
+        std::lock_guard<std::mutex> lock(self->detector_preview_mutex_);
+        if (!self->detector_preview_frame_ready_)
+            return G_SOURCE_CONTINUE;
+        frame = self->detector_preview_frame_.clone();
+        self->detector_preview_frame_ready_ = false;
+    }
+
+    if (frame.empty())
+        return G_SOURCE_CONTINUE;
+
+    try {
+        if (!self->detector_preview_window_created_) {
+            cv::namedWindow(self->detector_preview_window_name_, cv::WINDOW_NORMAL);
+            cv::resizeWindow(self->detector_preview_window_name_, frame.cols, frame.rows);
+            self->detector_preview_window_created_ = true;
+        }
+        cv::imshow(self->detector_preview_window_name_, frame);
+        cv::waitKey(1);
+    } catch (...) {
+    }
+
+    return G_SOURCE_CONTINUE;
+}
 void VideoComposite::start()
 {
+    stop_requested_ = false;
     gst_init(nullptr, nullptr);
     start_metadata_receivers();
 #ifdef __APPLE__
@@ -185,6 +260,9 @@ void VideoComposite::start()
 
 void VideoComposite::stop()
 {
+    stop_requested_ = true;
+    stopDetectorThread();
+    stop_metadata_receivers();
     if (main_loop_) {
         g_main_loop_quit(main_loop_);
     }
@@ -322,6 +400,175 @@ void VideoComposite::updateQuaternion(const buoy_proto::IMU_proto &msg)
     quat_.x = msg.quat_x();
     quat_.y = msg.quat_y();
     quat_.z = msg.quat_z();
+}
+
+void VideoComposite::startDetectorThread()
+{
+    if (!person_detection_enabled_ || detector_thread_running_)
+        return;
+    detector_thread_running_ = true;
+    detector_thread_ = std::thread(&VideoComposite::detectorWorkerLoop, this);
+}
+
+void VideoComposite::stopDetectorThread()
+{
+    if (!detector_thread_running_)
+        return;
+    detector_thread_running_ = false;
+    detector_cv_.notify_all();
+    if (detector_thread_.joinable())
+        detector_thread_.join();
+}
+
+std::vector<VideoComposite::DetectionBox> VideoComposite::runHogPersonDetector(const cv::Mat &bgr)
+{
+    static thread_local cv::HOGDescriptor hog;
+    static thread_local bool hog_ready = false;
+    if (!hog_ready) {
+        hog.setSVMDetector(cv::HOGDescriptor::getDefaultPeopleDetector());
+        hog_ready = true;
+    }
+
+    std::vector<cv::Rect> found;
+    std::vector<double> weights;
+    hog.detectMultiScale(
+        bgr,
+        found,
+        weights,
+        0.0,               // back to default-style thresholding
+        cv::Size(8, 8),
+        cv::Size(8, 8),
+        1.05,
+        2.0,               // restore grouping strength
+        false
+    );
+    std::vector<DetectionBox> boxes;
+    boxes.reserve(found.size());
+    for (size_t k = 0; k < found.size(); ++k) {
+        const auto &r = found[k];
+        if (r.width <= 0 || r.height <= 0)
+            continue;
+        if (r.height < bgr.rows / 8)
+            continue;
+        DetectionBox box;
+        box.x = r.x;
+        box.y = r.y;
+        box.w = r.width;
+        box.h = r.height;
+        box.score = (k < weights.size()) ? weights[k] : 0.0;
+        boxes.push_back(box);
+    }
+    return boxes;
+}
+
+void VideoComposite::detectorWorkerLoop()
+{
+    while (detector_thread_running_) {
+        cv::Mat frame_copy;
+        {
+            std::unique_lock<std::mutex> lock(detector_frame_mutex_);
+            detector_cv_.wait(lock, [this]{
+                return !detector_thread_running_ || detector_have_new_frame_;
+            });
+            if (!detector_thread_running_)
+                break;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (detector_last_run_tp_.time_since_epoch().count() != 0) {
+                const auto dt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - detector_last_run_tp_).count();
+                if (dt_ms < detector_period_ms_) {
+                    lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(detector_period_ms_ - dt_ms));
+                    continue;
+                }
+            }
+
+            frame_copy = detector_latest_frame_.clone();
+            detector_have_new_frame_ = false;
+            detector_last_run_tp_ = std::chrono::steady_clock::now();
+        }
+
+        if (frame_copy.empty())
+            continue;
+
+        std::vector<DetectionBox> boxes = runHogPersonDetector(frame_copy);
+        {
+            std::lock_guard<std::mutex> lock(detection_mutex_);
+            latest_composite_boxes_ = boxes;
+            latest_composite_detection_tp_ = std::chrono::steady_clock::now();
+        }
+
+        if (detector_preview_enabled_) {
+            cv::Mat preview = frame_copy.clone();
+            for (const auto &box : boxes) {
+                cv::rectangle(preview, cv::Rect(box.x, box.y, box.w, box.h), cv::Scalar(0, 255, 0), 2);
+                std::ostringstream label;
+                label << "person " << std::fixed << std::setprecision(2) << box.score;
+                cv::putText(preview, label.str(),
+                            cv::Point(box.x, std::max(18, box.y - 6)),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0,255,0), 1, cv::LINE_AA);
+            }
+            {
+                std::lock_guard<std::mutex> lock(detector_preview_mutex_);
+                detector_preview_frame_ = std::move(preview);
+                detector_preview_frame_ready_ = true;
+            }
+        }
+    }
+}
+
+GstFlowReturn VideoComposite::detector_new_sample_cb(GstAppSink *sink, gpointer user_data)
+{
+    auto *ctx = static_cast<DetectorSinkCtx *>(user_data);
+    if (!ctx || !ctx->self)
+        return GST_FLOW_OK;
+
+    VideoComposite *self = ctx->self;
+    if (!self->person_detection_enabled_)
+        return GST_FLOW_OK;
+
+    GstSample *sample = gst_app_sink_pull_sample(sink);
+    if (!sample)
+        return GST_FLOW_OK;
+
+    GstCaps *caps = gst_sample_get_caps(sample);
+    GstBuffer *buffer = gst_sample_get_buffer(sample);
+    if (!caps || !buffer) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    GstVideoInfo vinfo;
+    gst_video_info_init(&vinfo);
+    if (!gst_video_info_from_caps(&vinfo, caps)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    GstVideoFrame vframe;
+    if (!gst_video_frame_map(&vframe, &vinfo, buffer, GST_MAP_READ)) {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    const int width = GST_VIDEO_INFO_WIDTH(&vinfo);
+    const int height = GST_VIDEO_INFO_HEIGHT(&vinfo);
+    cv::Mat bgr(height,
+                width,
+                CV_8UC3,
+                GST_VIDEO_FRAME_PLANE_DATA(&vframe, 0),
+                GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 0));
+
+    {
+        std::lock_guard<std::mutex> lock(self->detector_frame_mutex_);
+        self->detector_latest_frame_ = bgr.clone();
+        self->detector_have_new_frame_ = true;
+    }
+    self->detector_cv_.notify_one();
+
+    gst_video_frame_unmap(&vframe);
+    gst_sample_unref(sample);
+    return GST_FLOW_OK;
 }
 
 GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *info,
@@ -548,6 +795,7 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     g_print("run_pipeline: self=%p\n", (void*)self);
 
     std::vector<BranchProbeCtx*> probe_ctxs;
+    std::vector<DetectorSinkCtx*> detector_ctxs;
 
     self->pipeline = gst_pipeline_new("video_pipeline");
     if (!self->pipeline) {
@@ -565,15 +813,36 @@ void *VideoComposite::run_pipeline(gpointer user_data)
 
     GstElement *record_queue = gst_element_factory_make("queue", "record_queue");
     GstElement *download = gst_element_factory_make("gldownload", "record_gldownload");
+    GstElement *record_split = gst_element_factory_make("tee", "record_split");
+    GstElement *record_enc_queue = gst_element_factory_make("queue", "record_enc_queue");
     GstElement *record_convert = gst_element_factory_make("videoconvert", "record_convert");
     GstElement *enc = gst_element_factory_make("x264enc", "record_enc");
     GstElement *parse = gst_element_factory_make("h264parse", "record_parse_out");
     GstElement *mux = gst_element_factory_make("matroskamux", "record_mux");
     GstElement *sink = gst_element_factory_make("filesink", "record_sink");
 
+    GstElement *det_queue = nullptr;
+    GstElement *det_convert = nullptr;
+    GstElement *det_scale = nullptr;
+    GstElement *det_caps = nullptr;
+    GstElement *det_sink = nullptr;
+
+    if (self->person_detection_enabled_) {
+        det_queue = gst_element_factory_make("queue", "det_queue");
+        det_convert = gst_element_factory_make("videoconvert", "det_convert");
+        det_scale = gst_element_factory_make("videoscale", "det_scale");
+        det_caps = gst_element_factory_make("capsfilter", "det_caps");
+        det_sink = gst_element_factory_make("appsink", "det_sink");
+    }
+
     if (!mix || !convert || !tee || !display_queue || !fps || !videosink ||
-        !record_queue || !download || !record_convert || !enc || !parse || !mux || !sink) {
+        !record_queue || !download || !record_convert || !record_split || !record_enc_queue || !enc || !parse || !mux || !sink) {
         g_printerr("run_pipeline: could not create core elements\n");
+        return NULL;
+    }
+
+    if (self->person_detection_enabled_ && (!det_queue || !det_convert || !det_scale || !det_caps || !det_sink)) {
+        g_printerr("run_pipeline: could not create detector side branch\n");
         return NULL;
     }
 
@@ -606,8 +875,38 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     gst_bin_add_many(GST_BIN(self->pipeline),
                      mix, convert, tee,
                      display_queue, fps,
-                     record_queue, download, record_convert, enc, parse, mux, sink,
+                     record_queue, download, record_split, record_enc_queue, record_convert, enc, parse, mux, sink,
                      NULL);
+
+    if (self->person_detection_enabled_) {
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                         det_queue, det_convert, det_scale, det_caps, det_sink,
+                         NULL);
+
+        g_object_set(det_queue,
+                     "leaky", 2,
+                     "max-size-buffers", 1,
+                     "max-size-bytes", 0,
+                     "max-size-time", 0,
+                     NULL);
+
+        g_object_set(det_sink,
+                     "emit-signals", TRUE,
+                     "max-buffers", 1,
+                     "drop", TRUE,
+                     "sync", FALSE,
+                     "async", FALSE,
+                     "wait-on-eos", FALSE,
+                     "enable-last-sample", FALSE,
+                     "qos", FALSE,
+                     NULL);
+
+        GstCaps *detector_caps = gst_caps_from_string((std::ostringstream()
+                                    << "video/x-raw,format=BGR,width=" << self->detector_width_
+                                    << ",height=" << self->detector_height_).str().c_str());
+        g_object_set(det_caps, "caps", detector_caps, NULL);
+        gst_caps_unref(detector_caps);
+    }
 
     if (!gst_element_link_many(mix, convert, tee, NULL)) {
         g_printerr("run_pipeline: failed to link core trunk\n");
@@ -619,9 +918,21 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         return NULL;
     }
 
-    if (!gst_element_link_many(record_queue, download, record_convert, enc, parse, mux, sink, NULL)) {
-        g_printerr("run_pipeline: failed to link record branch\n");
+    if (!gst_element_link_many(record_queue, download, record_split, NULL)) {
+        g_printerr("run_pipeline: failed to link record trunk\n");
         return NULL;
+    }
+
+    if (!gst_element_link_many(record_enc_queue, record_convert, enc, parse, mux, sink, NULL)) {
+        g_printerr("run_pipeline: failed to link record encode branch\n");
+        return NULL;
+    }
+
+    if (self->person_detection_enabled_) {
+        if (!gst_element_link_many(det_queue, det_convert, det_scale, det_caps, det_sink, NULL)) {
+            g_printerr("run_pipeline: failed to link detector branch\n");
+            return NULL;
+        }
     }
 
     GstPad *tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
@@ -660,6 +971,55 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     gst_object_unref(display_sink_pad);
     gst_object_unref(tee_record_pad);
     gst_object_unref(record_sink_pad);
+
+    // Split the CPU record path so detection cannot interfere with the original live GL display path.
+    {
+        GstPad *split_rec_pad = gst_element_request_pad_simple(record_split, "src_%u");
+        GstPad *rec_sink_pad2 = gst_element_get_static_pad(record_enc_queue, "sink");
+        if (!split_rec_pad || !rec_sink_pad2) {
+            g_printerr("run_pipeline: failed to get record-split encode pads\n");
+            if (split_rec_pad) gst_object_unref(split_rec_pad);
+            if (rec_sink_pad2) gst_object_unref(rec_sink_pad2);
+            return NULL;
+        }
+        if (gst_pad_link(split_rec_pad, rec_sink_pad2) != GST_PAD_LINK_OK) {
+            g_printerr("run_pipeline: failed to link record split to encode branch\n");
+            gst_object_unref(split_rec_pad);
+            gst_object_unref(rec_sink_pad2);
+            return NULL;
+        }
+        gst_object_unref(split_rec_pad);
+        gst_object_unref(rec_sink_pad2);
+    }
+
+    if (self->person_detection_enabled_) {
+        GstPad *split_det_pad = gst_element_request_pad_simple(record_split, "src_%u");
+        GstPad *det_sink_pad = gst_element_get_static_pad(det_queue, "sink");
+        if (!split_det_pad || !det_sink_pad) {
+            g_printerr("run_pipeline: failed to get detector split pads\n");
+            if (split_det_pad) gst_object_unref(split_det_pad);
+            if (det_sink_pad) gst_object_unref(det_sink_pad);
+            return NULL;
+        }
+        if (gst_pad_link(split_det_pad, det_sink_pad) != GST_PAD_LINK_OK) {
+            g_printerr("run_pipeline: failed to link record split to detector branch\n");
+            gst_object_unref(split_det_pad);
+            gst_object_unref(det_sink_pad);
+            return NULL;
+        }
+        gst_object_unref(split_det_pad);
+        gst_object_unref(det_sink_pad);
+
+        auto *det_ctx = new DetectorSinkCtx();
+        det_ctx->self = self;
+        detector_ctxs.push_back(det_ctx);
+        g_signal_connect(det_sink, "new-sample", G_CALLBACK(VideoComposite::detector_new_sample_cb), det_ctx);
+        self->startDetectorThread();
+
+        if (self->detector_preview_enabled_ && self->detector_preview_timer_id_ == 0) {
+            self->detector_preview_timer_id_ = g_timeout_add(33, VideoComposite::detector_preview_tick_cb, self);
+        }
+    }
 
     g_print("Recording composite output to: %s\n", record_path);
 
@@ -804,7 +1164,14 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     gst_element_set_state(self->pipeline, GST_STATE_PLAYING);
     self->main_loop_ = g_main_loop_new(NULL, FALSE);
     g_print("Running base station. Press Ctrl+C to stop.\n");
+    if (self->person_detection_enabled_) {
+        g_print("Person detection side branch is ENABLED (HOG, %d ms period, %dx%d input)\n",
+                self->detector_period_ms_, self->detector_width_, self->detector_height_);
+        g_print("Live display path is unchanged from the original pipeline\n");
+    }
     g_main_loop_run(self->main_loop_);
+
+    self->stopDetectorThread();
 
     GstBus *shutdown_bus = gst_element_get_bus(self->pipeline);
     gst_element_send_event(self->pipeline, gst_event_new_eos());
@@ -817,21 +1184,6 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     if (!shutdown_msg) {
         g_printerr("run_pipeline: timed out waiting for EOS during shutdown; finalizing file may be incomplete\n");
     } else {
-        if (GST_MESSAGE_TYPE(shutdown_msg) == GST_MESSAGE_ERROR) {
-            GError *err = nullptr;
-            gchar *dbg = nullptr;
-            gst_message_parse_error(shutdown_msg, &err, &dbg);
-            g_printerr("run_pipeline: shutdown error from %s: %s\n",
-                       GST_OBJECT_NAME(shutdown_msg->src),
-                       err ? err->message : "unknown error");
-            if (dbg) {
-                g_printerr("run_pipeline: shutdown debug info: %s\n", dbg);
-                g_free(dbg);
-            }
-            if (err) {
-                g_error_free(err);
-            }
-        }
         gst_message_unref(shutdown_msg);
     }
     gst_object_unref(shutdown_bus);
@@ -849,6 +1201,8 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         self->main_loop_ = nullptr;
     }
     for (auto *ctx : probe_ctxs)
+        delete ctx;
+    for (auto *ctx : detector_ctxs)
         delete ctx;
     return NULL;
 }
