@@ -28,7 +28,10 @@ pkg_check_modules(GST_APP REQUIRED IMPORTED_TARGET
     gstreamer-app-1.0
 )
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc objdetect highgui)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc objdetect highgui dnn)
+
+option(ENABLE_ORT_YOLO "Enable YOLOv8 backend via ONNX Runtime C++" OFF)
+set(ONNXRUNTIME_ROOT "" CACHE PATH "Path to extracted ONNX Runtime release with include/ and lib/")
 find_package(yaml-cpp REQUIRED)
 
 add_executable(gl_composite_test prototest.cpp)
@@ -54,3 +57,23 @@ target_link_libraries(base_station PRIVATE
     PkgConfig::GST_APP
     ${OpenCV_LIBS}
 )
+
+
+if(ENABLE_ORT_YOLO)
+    find_path(ONNXRUNTIME_INCLUDE_DIR
+        NAMES onnxruntime/core/session/onnxruntime_cxx_api.h
+        HINTS ${ONNXRUNTIME_ROOT}/include)
+    find_library(ONNXRUNTIME_LIB
+        NAMES onnxruntime
+        HINTS ${ONNXRUNTIME_ROOT}/lib ${ONNXRUNTIME_ROOT}/lib64)
+    if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
+        message(STATUS "Found ONNX Runtime: ${ONNXRUNTIME_LIB}")
+        target_include_directories(base_station PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_link_libraries(base_station PRIVATE ${ONNXRUNTIME_LIB})
+        target_compile_definitions(base_station PRIVATE HAVE_ORT=1)
+        get_filename_component(ONNXRUNTIME_LIB_DIR ${ONNXRUNTIME_LIB} DIRECTORY)
+        set_target_properties(base_station PROPERTIES BUILD_RPATH ${ONNXRUNTIME_LIB_DIR})
+    else()
+        message(FATAL_ERROR "ENABLE_ORT_YOLO=ON but ONNX Runtime was not found. Set ONNXRUNTIME_ROOT to the extracted release directory.")
+    endif()
+endif()

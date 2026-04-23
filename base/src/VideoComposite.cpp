@@ -10,6 +10,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/dnn.hpp>
 #include <math.h>
 #include <stdio.h>
 #include <vector>
@@ -25,6 +26,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <iomanip>
+#include <cctype>
 
 using namespace MathHelpers;
 
@@ -132,6 +134,9 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
         }
     }
 
+    if (const char *main_rec_env = std::getenv("RECORD_OUTPUT")) {
+        main_record_enabled_ = std::atoi(main_rec_env) != 0;
+    }
     if (const char *det_env = std::getenv("ENABLE_PERSON_DETECTION")) {
         person_detection_enabled_ = std::atoi(det_env) != 0;
     }
@@ -147,6 +152,24 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
     if (const char *prev_env = std::getenv("SHOW_PERSON_DET_PREVIEW")) {
         detector_preview_enabled_ = std::atoi(prev_env) != 0;
     }
+    if (const char *backend_env = std::getenv("PERSON_DET_BACKEND")) {
+        detector_backend_ = backend_env;
+        std::transform(detector_backend_.begin(), detector_backend_.end(), detector_backend_.begin(),
+                       [](unsigned char c){ return static_cast<char>(std::tolower(c)); });
+    }
+#ifdef HAVE_ORT
+    if ((detector_backend_ == "yolov8" || detector_backend_ == "yolo" || detector_backend_ == "ort") ) {
+        yolo_ort_ready_ = initYoloOrtSession();
+        if (!yolo_ort_ready_) {
+            detector_backend_ = "hog";
+        }
+    }
+#else
+    if (detector_backend_ == "yolov8" || detector_backend_ == "yolo" || detector_backend_ == "ort") {
+        g_printerr("[detector] YOLOv8 backend requested but this build does not include ONNX Runtime. Falling back to HOG\n");
+        detector_backend_ = "hog";
+    }
+#endif
 
     std::ifstream in(shaderPath);
     if (!in) {
@@ -420,6 +443,231 @@ void VideoComposite::stopDetectorThread()
         detector_thread_.join();
 }
 
+
+#ifdef HAVE_ORT
+bool VideoComposite::initYoloOrtSession()
+{
+    const char *model_env = std::getenv("YOLO_MODEL_PATH");
+    if (!model_env || std::string(model_env).empty()) {
+        g_printerr("[detector] YOLO_MODEL_PATH not set; cannot initialize YOLOv8 backend\n");
+        return false;
+    }
+
+    try {
+        ort_session_options_.SetIntraOpNumThreads(1);
+        ort_session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+
+        ort_session_ = std::make_unique<Ort::Session>(ort_env_, model_env, ort_session_options_);
+
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto in_name = ort_session_->GetInputNameAllocated(0, allocator);
+        ort_input_name_ = in_name.get();
+
+        auto input_type_info = ort_session_->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
+        auto input_shape = input_type_info.GetShape();
+        if (input_shape.size() >= 4) {
+            if (input_shape[2] > 0) yolo_model_input_h_ = static_cast<int>(input_shape[2]);
+            if (input_shape[3] > 0) yolo_model_input_w_ = static_cast<int>(input_shape[3]);
+        }
+
+        ort_output_names_.clear();
+        const size_t out_count = ort_session_->GetOutputCount();
+        ort_output_names_.reserve(out_count);
+        for (size_t i = 0; i < out_count; ++i) {
+            auto out_name = ort_session_->GetOutputNameAllocated(i, allocator);
+            ort_output_names_.push_back(out_name.get());
+        }
+        g_print("[detector] YOLOv8 ONNX Runtime backend initialized: %s\n", model_env);
+        return true;
+    } catch (const std::exception &e) {
+        g_printerr("[detector] Failed to initialize YOLOv8 ONNX Runtime backend: %s\n", e.what());
+        return false;
+    }
+}
+#endif
+
+std::vector<VideoComposite::DetectionBox> VideoComposite::runDetector(const cv::Mat &bgr)
+{
+    if (detector_backend_ == "yolov8" || detector_backend_ == "yolo" || detector_backend_ == "ort") {
+        return runYoloV8Detector(bgr);
+    }
+    return runHogPersonDetector(bgr);
+}
+
+std::vector<VideoComposite::DetectionBox> VideoComposite::runYoloV8Detector(const cv::Mat &bgr)
+{
+#ifndef HAVE_ORT
+    (void)bgr;
+    return {};
+#else
+    std::vector<DetectionBox> boxes_out;
+    if (!yolo_ort_ready_ || !ort_session_) {
+        return boxes_out;
+    }
+
+    const int input_w = yolo_model_input_w_ > 0 ? yolo_model_input_w_ : detector_width_;
+    const int input_h = yolo_model_input_h_ > 0 ? yolo_model_input_h_ : detector_height_;
+
+    cv::Mat resized;
+    cv::resize(bgr, resized, cv::Size(input_w, input_h));
+
+    std::vector<float> input_tensor_values(static_cast<size_t>(3 * input_w * input_h));
+    for (int y = 0; y < input_h; ++y) {
+        const cv::Vec3b* row = resized.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < input_w; ++x) {
+            const cv::Vec3b& px = row[x];
+            const size_t idx = static_cast<size_t>(y * input_w + x);
+            input_tensor_values[idx] = px[2] / 255.0f;
+            input_tensor_values[input_w * input_h + idx] = px[1] / 255.0f;
+            input_tensor_values[2 * input_w * input_h + idx] = px[0] / 255.0f;
+        }
+    }
+
+    const std::array<int64_t, 4> input_shape{1, 3, input_h, input_w};
+    Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        memory_info, input_tensor_values.data(), input_tensor_values.size(),
+        input_shape.data(), input_shape.size());
+
+    std::vector<const char*> output_names;
+    output_names.reserve(ort_output_names_.size());
+    for (const auto& s : ort_output_names_) output_names.push_back(s.c_str());
+
+    const char* input_names[] = { ort_input_name_.c_str() };
+
+    auto output_tensors = ort_session_->Run(Ort::RunOptions{nullptr},
+                                            input_names,
+                                            &input_tensor,
+                                            1,
+                                            output_names.data(),
+                                            output_names.size());
+                                            
+    if (output_tensors.empty()) {
+        return boxes_out;
+    }
+
+    Ort::Value &outv = output_tensors[0];
+    auto type_info = outv.GetTensorTypeAndShapeInfo();
+    auto shape = type_info.GetShape();
+    const float* data = outv.GetTensorData<float>();
+    if (!data || shape.size() < 3) {
+        return boxes_out;
+    }
+
+    int rows = 0;
+    int dims = 0;
+    bool transposed = false;
+    if (shape.size() == 3) {
+        const int d1 = static_cast<int>(shape[1]);
+        const int d2 = static_cast<int>(shape[2]);
+        if (d1 > 0 && d1 <= 256 && d2 > d1) {
+            dims = d1;
+            rows = d2;
+            transposed = true;   // [1, dims, rows], common for YOLOv8 ONNX
+        } else {
+            rows = d1;
+            dims = d2;
+            transposed = false;  // [1, rows, dims]
+        }
+    } else {
+        return boxes_out;
+    }
+
+    if (dims < 4 || rows <= 0) {
+        return boxes_out;
+    }
+
+    std::vector<cv::Rect> rects;
+    std::vector<float> scores;
+    const int person_class = 0;
+    const bool has_objectness = (dims >= 6 && dims < 84);
+
+    for (int i = 0; i < rows; ++i) {
+        auto getv = [&](int d)->float {
+            if (transposed) return data[d * rows + i];
+            return data[i * dims + d];
+        };
+
+        const float a = getv(0);
+        const float b = getv(1);
+        const float c = getv(2);
+        const float d = getv(3);
+
+        float score = 0.0f;
+        if (has_objectness) {
+            const float objectness = getv(4);
+            float class_score = 1.0f;
+            if (5 + person_class < dims) class_score = getv(5 + person_class);
+            score = objectness * class_score;
+        } else if (4 + person_class < dims) {
+            score = getv(4 + person_class);
+        }
+        if (score < detector_conf_threshold_) continue;
+
+        float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
+
+        const bool looks_like_xyxy = (c > a) && (d > b);
+        if (looks_like_xyxy) {
+            x1 = a; y1 = b; x2 = c; y2 = d;
+        } else {
+            const float cx = a;
+            const float cy = b;
+            const float w = c;
+            const float h = d;
+            x1 = cx - 0.5f * w;
+            y1 = cy - 0.5f * h;
+            x2 = cx + 0.5f * w;
+            y2 = cy + 0.5f * h;
+        }
+
+        const bool normalized = std::fabs(x1) <= 2.0f && std::fabs(y1) <= 2.0f &&
+                                std::fabs(x2) <= 2.0f && std::fabs(y2) <= 2.0f;
+        if (normalized) {
+            x1 *= static_cast<float>(bgr.cols);
+            x2 *= static_cast<float>(bgr.cols);
+            y1 *= static_cast<float>(bgr.rows);
+            y2 *= static_cast<float>(bgr.rows);
+        } else {
+            const float sx = static_cast<float>(bgr.cols) / static_cast<float>(input_w);
+            const float sy = static_cast<float>(bgr.rows) / static_cast<float>(input_h);
+            x1 *= sx; x2 *= sx;
+            y1 *= sy; y2 *= sy;
+        }
+
+        int left = static_cast<int>(std::round(std::min(x1, x2)));
+        int top = static_cast<int>(std::round(std::min(y1, y2)));
+        int right = static_cast<int>(std::round(std::max(x1, x2)));
+        int bottom = static_cast<int>(std::round(std::max(y1, y2)));
+
+        left = std::max(0, std::min(left, bgr.cols - 1));
+        top = std::max(0, std::min(top, bgr.rows - 1));
+        right = std::max(0, std::min(right, bgr.cols));
+        bottom = std::max(0, std::min(bottom, bgr.rows));
+
+        int bw = right - left;
+        int bh = bottom - top;
+        if (bw <= 1 || bh <= 1) continue;
+
+        rects.emplace_back(left, top, bw, bh);
+        scores.push_back(score);
+    }
+
+    std::vector<int> keep;
+    cv::dnn::NMSBoxes(rects, scores, detector_conf_threshold_, detector_nms_threshold_, keep);
+    boxes_out.reserve(keep.size());
+    for (int idx : keep) {
+        DetectionBox box;
+        box.x = rects[idx].x;
+        box.y = rects[idx].y;
+        box.w = rects[idx].width;
+        box.h = rects[idx].height;
+        box.score = scores[idx];
+        boxes_out.push_back(box);
+    }
+    return boxes_out;
+#endif
+}
+
 std::vector<VideoComposite::DetectionBox> VideoComposite::runHogPersonDetector(const cv::Mat &bgr)
 {
     static thread_local cv::HOGDescriptor hog;
@@ -431,17 +679,8 @@ std::vector<VideoComposite::DetectionBox> VideoComposite::runHogPersonDetector(c
 
     std::vector<cv::Rect> found;
     std::vector<double> weights;
-    hog.detectMultiScale(
-        bgr,
-        found,
-        weights,
-        0.0,               // back to default-style thresholding
-        cv::Size(8, 8),
-        cv::Size(8, 8),
-        1.05,
-        2.0,               // restore grouping strength
-        false
-    );
+    hog.detectMultiScale(bgr, found, weights, 0.0, cv::Size(8, 8), cv::Size(16, 16), 1.05, 2.0, false);
+
     std::vector<DetectionBox> boxes;
     boxes.reserve(found.size());
     for (size_t k = 0; k < found.size(); ++k) {
@@ -491,7 +730,7 @@ void VideoComposite::detectorWorkerLoop()
         if (frame_copy.empty())
             continue;
 
-        std::vector<DetectionBox> boxes = runHogPersonDetector(frame_copy);
+        std::vector<DetectionBox> boxes = runDetector(frame_copy);
         {
             std::lock_guard<std::mutex> lock(detection_mutex_);
             latest_composite_boxes_ = boxes;
@@ -811,15 +1050,15 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     GstElement *fps = gst_element_factory_make("fpsdisplaysink", "fps");
     GstElement *videosink = gst_element_factory_make("glimagesink", "vsink");
 
-    GstElement *record_queue = gst_element_factory_make("queue", "record_queue");
+    GstElement *record_queue = self->main_record_enabled_ ? gst_element_factory_make("queue", "record_queue") : nullptr;
     GstElement *download = gst_element_factory_make("gldownload", "record_gldownload");
     GstElement *record_split = gst_element_factory_make("tee", "record_split");
-    GstElement *record_enc_queue = gst_element_factory_make("queue", "record_enc_queue");
-    GstElement *record_convert = gst_element_factory_make("videoconvert", "record_convert");
-    GstElement *enc = gst_element_factory_make("x264enc", "record_enc");
-    GstElement *parse = gst_element_factory_make("h264parse", "record_parse_out");
-    GstElement *mux = gst_element_factory_make("matroskamux", "record_mux");
-    GstElement *sink = gst_element_factory_make("filesink", "record_sink");
+    GstElement *record_enc_queue = self->main_record_enabled_ ? gst_element_factory_make("queue", "record_enc_queue") : nullptr;
+    GstElement *record_convert = self->main_record_enabled_ ? gst_element_factory_make("videoconvert", "record_convert") : nullptr;
+    GstElement *enc = self->main_record_enabled_ ? gst_element_factory_make("x264enc", "record_enc") : nullptr;
+    GstElement *parse = self->main_record_enabled_ ? gst_element_factory_make("h264parse", "record_parse_out") : nullptr;
+    GstElement *mux = self->main_record_enabled_ ? gst_element_factory_make("matroskamux", "record_mux") : nullptr;
+    GstElement *sink = self->main_record_enabled_ ? gst_element_factory_make("filesink", "record_sink") : nullptr;
 
     GstElement *det_queue = nullptr;
     GstElement *det_convert = nullptr;
@@ -835,8 +1074,8 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         det_sink = gst_element_factory_make("appsink", "det_sink");
     }
 
-    if (!mix || !convert || !tee || !display_queue || !fps || !videosink ||
-        !record_queue || !download || !record_convert || !record_split || !record_enc_queue || !enc || !parse || !mux || !sink) {
+    if (!mix || !convert || !tee || !display_queue || !fps || !videosink || !download || !record_split ||
+        (self->main_record_enabled_ && (!record_queue || !record_convert || !record_enc_queue || !enc || !parse || !mux || !sink))) {
         g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
     }
@@ -858,25 +1097,35 @@ void *VideoComposite::run_pipeline(gpointer user_data)
                  "text-overlay", TRUE,
                  "sync", FALSE,
                  NULL);
-    g_object_set(enc,
-                 "tune", 0x00000004,
-                 "speed-preset", 1,
-                 "bitrate", 10000,
-                 NULL);
-    g_object_set(mux,
-                 "streamable", FALSE,
-                 NULL);
-    g_object_set(sink,
-                 "location", record_path,
-                 "sync", FALSE,
-                 "async", FALSE,
-                 NULL);
+    if (self->main_record_enabled_) {
+        g_object_set(enc,
+                     "tune", 0x00000004,
+                     "speed-preset", 1,
+                     "bitrate", 10000,
+                     NULL);
+        g_object_set(mux,
+                     "streamable", FALSE,
+                     NULL);
+        g_object_set(sink,
+                     "location", record_path,
+                     "sync", FALSE,
+                     "async", FALSE,
+                     NULL);
+    }
 
     gst_bin_add_many(GST_BIN(self->pipeline),
                      mix, convert, tee,
                      display_queue, fps,
-                     record_queue, download, record_split, record_enc_queue, record_convert, enc, parse, mux, sink,
                      NULL);
+    if (self->main_record_enabled_) {
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                         record_queue, download, record_split, record_enc_queue, record_convert, enc, parse, mux, sink,
+                         NULL);
+    } else {
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                         download, record_split,
+                         NULL);
+    }
 
     if (self->person_detection_enabled_) {
         gst_bin_add_many(GST_BIN(self->pipeline),
@@ -918,14 +1167,21 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         return NULL;
     }
 
-    if (!gst_element_link_many(record_queue, download, record_split, NULL)) {
-        g_printerr("run_pipeline: failed to link record trunk\n");
-        return NULL;
-    }
+    if (self->main_record_enabled_) {
+        if (!gst_element_link_many(record_queue, download, record_split, NULL)) {
+            g_printerr("run_pipeline: failed to link record trunk\n");
+            return NULL;
+        }
 
-    if (!gst_element_link_many(record_enc_queue, record_convert, enc, parse, mux, sink, NULL)) {
-        g_printerr("run_pipeline: failed to link record encode branch\n");
-        return NULL;
+        if (!gst_element_link_many(record_enc_queue, record_convert, enc, parse, mux, sink, NULL)) {
+            g_printerr("run_pipeline: failed to link record encode branch\n");
+            return NULL;
+        }
+    } else {
+        if (!gst_element_link_many(download, record_split, NULL)) {
+            g_printerr("run_pipeline: failed to link CPU split trunk\n");
+            return NULL;
+        }
     }
 
     if (self->person_detection_enabled_) {
@@ -937,15 +1193,15 @@ void *VideoComposite::run_pipeline(gpointer user_data)
 
     GstPad *tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
     GstPad *display_sink_pad = gst_element_get_static_pad(display_queue, "sink");
-    GstPad *tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
-    GstPad *record_sink_pad = gst_element_get_static_pad(record_queue, "sink");
+    GstPad *tee_cpu_pad = gst_element_request_pad_simple(tee, "src_%u");
+    GstPad *cpu_sink_pad = gst_element_get_static_pad(self->main_record_enabled_ ? record_queue : download, "sink");
 
-    if (!tee_display_pad || !display_sink_pad || !tee_record_pad || !record_sink_pad) {
+    if (!tee_display_pad || !display_sink_pad || !tee_cpu_pad || !cpu_sink_pad) {
         g_printerr("run_pipeline: failed to get tee/request pads\n");
         if (tee_display_pad) gst_object_unref(tee_display_pad);
         if (display_sink_pad) gst_object_unref(display_sink_pad);
-        if (tee_record_pad) gst_object_unref(tee_record_pad);
-        if (record_sink_pad) gst_object_unref(record_sink_pad);
+        if (tee_cpu_pad) gst_object_unref(tee_cpu_pad);
+        if (cpu_sink_pad) gst_object_unref(cpu_sink_pad);
         return NULL;
     }
 
@@ -953,27 +1209,27 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         g_printerr("run_pipeline: failed to link tee to display branch\n");
         gst_object_unref(tee_display_pad);
         gst_object_unref(display_sink_pad);
-        gst_object_unref(tee_record_pad);
-        gst_object_unref(record_sink_pad);
+        gst_object_unref(tee_cpu_pad);
+        gst_object_unref(cpu_sink_pad);
         return NULL;
     }
 
-    if (gst_pad_link(tee_record_pad, record_sink_pad) != GST_PAD_LINK_OK) {
-        g_printerr("run_pipeline: failed to link tee to record branch\n");
+    if (gst_pad_link(tee_cpu_pad, cpu_sink_pad) != GST_PAD_LINK_OK) {
+        g_printerr("run_pipeline: failed to link tee to CPU branch\n");
         gst_object_unref(tee_display_pad);
         gst_object_unref(display_sink_pad);
-        gst_object_unref(tee_record_pad);
-        gst_object_unref(record_sink_pad);
+        gst_object_unref(tee_cpu_pad);
+        gst_object_unref(cpu_sink_pad);
         return NULL;
     }
 
     gst_object_unref(tee_display_pad);
     gst_object_unref(display_sink_pad);
-    gst_object_unref(tee_record_pad);
-    gst_object_unref(record_sink_pad);
+    gst_object_unref(tee_cpu_pad);
+    gst_object_unref(cpu_sink_pad);
 
-    // Split the CPU record path so detection cannot interfere with the original live GL display path.
-    {
+    if (self->main_record_enabled_) {
+        // Split the CPU path so detection cannot interfere with the original live GL display path.
         GstPad *split_rec_pad = gst_element_request_pad_simple(record_split, "src_%u");
         GstPad *rec_sink_pad2 = gst_element_get_static_pad(record_enc_queue, "sink");
         if (!split_rec_pad || !rec_sink_pad2) {
@@ -1021,7 +1277,11 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         }
     }
 
-    g_print("Recording composite output to: %s\n", record_path);
+    if (self->main_record_enabled_) {
+        g_print("Recording composite output to: %s\n", record_path);
+    } else {
+        g_print("Composite output recording disabled (RECORD_OUTPUT=0)\n");
+    }
 
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
@@ -1165,8 +1425,8 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     self->main_loop_ = g_main_loop_new(NULL, FALSE);
     g_print("Running base station. Press Ctrl+C to stop.\n");
     if (self->person_detection_enabled_) {
-        g_print("Person detection side branch is ENABLED (HOG, %d ms period, %dx%d input)\n",
-                self->detector_period_ms_, self->detector_width_, self->detector_height_);
+        g_print("Person detection side branch is ENABLED (%s, %d ms period, %dx%d input)\n",
+                self->detector_backend_.c_str(), self->detector_period_ms_, self->detector_width_, self->detector_height_);
         g_print("Live display path is unchanged from the original pipeline\n");
     }
     g_main_loop_run(self->main_loop_);

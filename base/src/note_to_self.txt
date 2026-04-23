@@ -1,0 +1,22 @@
+build:
+cd ~/Documents/GitHub/Personal/WRLD-capstone/base/build
+rm -rf CMakeCache.txt CMakeFiles
+
+cmake /home/lukec/Documents/GitHub/Personal/WRLD-capstone/base/src \
+  -DOpenCV_DIR=$HOME/.local/opencv-4.10/lib/cmake/opencv4 \
+  -DENABLE_ORT_YOLO=ON \
+  -DONNXRUNTIME_ROOT=$HOME/opt/onnxruntime-linux-x64-1.25.0 \
+  -DONNXRUNTIME_INCLUDE_DIR=$HOME/opt/onnxruntime-linux-x64-1.25.0/include \
+  -DONNXRUNTIME_LIB=$HOME/opt/onnxruntime-linux-x64-1.25.0/lib/libonnxruntime.so.1.25.0
+
+make -j"$(nproc)"
+
+run:
+export LD_LIBRARY_PATH=$HOME/opt/onnxruntime-linux-x64-1.25.0/lib:$LD_LIBRARY_PATH
+
+RECORD_OUTPUT=0 \
+ENABLE_PERSON_DETECTION=1 \
+PERSON_DET_BACKEND=yolov8 \
+YOLO_MODEL_PATH=$HOME/Documents/GitHub/Personal/WRLD-capstone/base/yolov8n.onnx \
+PERSON_DET_PERIOD_MS=100 \
+./base_station

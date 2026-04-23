@@ -7,6 +7,10 @@
 #include "MathHelpers.h"
 #include <opencv2/core.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/dnn.hpp>
+#ifdef HAVE_ORT
+#include <onnxruntime_cxx_api.h>
+#endif
 #include <string>
 #include <vector>
 #include <array>
@@ -116,10 +120,15 @@ private:
 
     // Detection side branch. No live-display overlay so timing stays close to the original path.
     bool person_detection_enabled_ = false;
-    int detector_width_ = 320;
-    int detector_height_ = 320;
-    int detector_period_ms_ = 500;
+    std::string detector_backend_ = "hog";
+    int detector_width_ = 640;
+    int detector_height_ = 360;
+    int detector_period_ms_ = 200;
+
+    float detector_conf_threshold_ = 0.35f;
+    float detector_nms_threshold_ = 0.45f;
     bool detector_preview_enabled_ = true;
+    bool main_record_enabled_ = true;
     bool detector_preview_window_created_ = false;
     std::string detector_preview_window_name_ = "Person Detection Debug";
     guint detector_preview_timer_id_ = 0;
@@ -145,6 +154,19 @@ private:
     void stopDetectorThread();
     void detectorWorkerLoop();
     std::vector<DetectionBox> runHogPersonDetector(const cv::Mat &bgr);
+    std::vector<DetectionBox> runYoloV8Detector(const cv::Mat &bgr);
+    std::vector<DetectionBox> runDetector(const cv::Mat &bgr);
+#ifdef HAVE_ORT
+    bool initYoloOrtSession();
+    bool yolo_ort_ready_ = false;
+    Ort::Env ort_env_{ORT_LOGGING_LEVEL_WARNING, "person_det"};
+    Ort::SessionOptions ort_session_options_;
+    std::unique_ptr<Ort::Session> ort_session_;
+    std::string ort_input_name_;
+    std::vector<std::string> ort_output_names_;
+    int yolo_model_input_w_ = 640;
+    int yolo_model_input_h_ = 640;
+#endif
 };
 
 #endif // VIDEOCOMPOSITE_H
