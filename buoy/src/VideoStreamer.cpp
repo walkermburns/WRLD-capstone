@@ -176,9 +176,9 @@ VideoStreamer::VideoStreamer(const std::string &dstIp,
     if (dstPort2 > 0) {
         pipeline << " "
                  << "libcamerasrc camera-name=\"" << camSecondary << "\" "
-                 << "! video/x-raw,width=1920,height=1080,framerate=30/1,format=I420 "
-                 << "! queue max-size-buffers=2 leaky=downstream "
-                 << "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=6000 key-int-max=30 bframes=0 cabac=false ref=1 sliced-threads=true threads=4 "
+                 << "! video/x-raw,width=1280,height=720,framerate=30/1,format=I420 "
+                 << "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+                 << "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=4000 key-int-max=30 bframes=0 cabac=false ref=1 sliced-threads=true threads=2 byte-stream=true "
                  << "! video/x-h264,profile=baseline "
                  << "! rtph264pay name=pay1 config-interval=1 pt=96 ssrc=305419897 seqnum-offset=3000 timestamp-offset=4000 "
                  << "! udpsink name=usink2 host=" << dstIp << " port=" << dstPort2 << " sync=false";

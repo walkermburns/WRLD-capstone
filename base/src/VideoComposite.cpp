@@ -120,20 +120,30 @@ make_feeds_from_legacy_ports(const std::vector<int> &ports)
 }
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
-                               const std::vector<int> &ports)
-    : VideoComposite(shaderPath, make_feeds_from_legacy_ports(ports))
+                                                             const std::vector<int> &ports,
+                                                             bool enableRecording,
+                                                             const std::string &recordPath)
+        : VideoComposite(shaderPath,
+                                         make_feeds_from_legacy_ports(ports),
+                                         enableRecording,
+                                         recordPath)
 {
 }
 
 VideoComposite::VideoComposite(const std::string &shaderPath,
-                               const std::vector<CameraFeedConfig> &feeds)
+                                                             const std::vector<CameraFeedConfig> &feeds,
+                                                             bool enableRecording,
+                                                             const std::string &recordPath)
     : pipeline(nullptr), mix_element(nullptr), main_loop_(nullptr), live_k1(0.3f), live_zoom(1.1f),
       live_w(1920.0f), live_h(1080.0f),
       live_h00(1.0f), live_h01(0.0f), live_h02(0.0f),
       live_h10(0.0f), live_h11(1.0f), live_h12(0.0f),
       live_h20(0.0f), live_h21(0.0f), live_h22(1.0f),
-      num_src(0), uniforms(nullptr), stab(), branch_active(), quat_(), nodes_(nullptr)
+            num_src(0), uniforms(nullptr), stab(), branch_active(), quat_(), nodes_(nullptr)
 {
+        record_enabled_ = enableRecording;
+        record_path_override_ = recordPath;
+
     feeds_ = feeds;
     num_src = static_cast<int>(feeds_.size());
     stab.assign(num_src, nullptr);
@@ -186,6 +196,10 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
 VideoComposite::~VideoComposite()
 {
     stop_metadata_receivers();
+    for (auto *s : shaders_) {
+        if (s) gst_object_unref(s);
+    }
+    shaders_.clear();
     if (pipeline) {
         gst_element_set_state(pipeline, GST_STATE_NULL);
         for (int i = 0; i < num_src && i < (int)stab.size(); i++) {
@@ -511,12 +525,8 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
                                            "h22", G_TYPE_FLOAT, H[8],
                                            NULL);
 
-    char name[32];
-    snprintf(name, sizeof(name), "lens%d", i);
-    GstElement *shader = gst_bin_get_by_name(GST_BIN(self->pipeline), name);
-    if (shader) {
-        g_object_set(shader, "uniforms", vars, NULL);
-        gst_object_unref(shader);
+    if (i < (int)self->shaders_.size() && self->shaders_[i]) {
+        g_object_set(self->shaders_[i], "uniforms", vars, NULL);
     }
     gst_structure_free(vars);
 
@@ -593,26 +603,43 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     GstElement *fps = gst_element_factory_make("fpsdisplaysink", "fps");
     GstElement *videosink = gst_element_factory_make("glimagesink", "vsink");
 
-    GstElement *record_queue = gst_element_factory_make("queue", "record_queue");
-    GstElement *download = gst_element_factory_make("gldownload", "record_gldownload");
-    GstElement *record_convert = gst_element_factory_make("videoconvert", "record_convert");
-    GstElement *record_caps = gst_element_factory_make("capsfilter", "record_caps");
-    GstElement *enc = gst_element_factory_make("x264enc", "record_enc");
-    GstElement *parse = gst_element_factory_make("h264parse", "record_parse_out");
-    GstElement *mux = gst_element_factory_make("matroskamux", "record_mux");
-    GstElement *sink = gst_element_factory_make("filesink", "record_sink");
+    GstElement *record_queue = nullptr;
+    GstElement *download = nullptr;
+    GstElement *record_convert = nullptr;
+    GstElement *record_caps = nullptr;
+    GstElement *enc = nullptr;
+    GstElement *parse = nullptr;
+    GstElement *mux = nullptr;
+    GstElement *sink = nullptr;
+
+    const bool record_enabled = self->record_enabled_;
+    if (record_enabled) {
+        record_queue = gst_element_factory_make("queue", "record_queue");
+        download = gst_element_factory_make("gldownload", "record_gldownload");
+        record_convert = gst_element_factory_make("videoconvert", "record_convert");
+        record_caps = gst_element_factory_make("capsfilter", "record_caps");
+        enc = gst_element_factory_make("x264enc", "record_enc");
+        parse = gst_element_factory_make("h264parse", "record_parse_out");
+        mux = gst_element_factory_make("matroskamux", "record_mux");
+        sink = gst_element_factory_make("filesink", "record_sink");
+    }
 
     if (!mix || !convert || !tee || !display_queue || !fps || !videosink ||
-        !record_queue || !download || !record_convert || !record_caps || !enc || !parse || !mux || !sink) {
+        (record_enabled && (!record_queue || !download || !record_convert || !record_caps || !enc || !parse || !mux || !sink))) {
         g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
     }
 
     const char *record_path_env = std::getenv("GST_RECORD_PATH");
     std::string default_record_path = make_default_record_path();
-    const char *record_path = (record_path_env && record_path_env[0] != '\0')
-                                ? record_path_env
-                                : default_record_path.c_str();
+    const char *record_path = nullptr;
+    if (!self->record_path_override_.empty()) {
+        record_path = self->record_path_override_.c_str();
+    } else if (record_path_env && record_path_env[0] != '\0') {
+        record_path = record_path_env;
+    } else {
+        record_path = default_record_path.c_str();
+    }
 
     g_object_set(mix, "background", 1, NULL);
     g_object_set(fps,
@@ -620,25 +647,46 @@ void *VideoComposite::run_pipeline(gpointer user_data)
                  "text-overlay", TRUE,
                  "sync", FALSE,
                  NULL);
-    g_object_set(enc,
-                 "tune", 0x00000004,
-                 "speed-preset", 1,
-                 "bitrate", 10000,
+    g_object_set(display_queue,
+                 "max-size-buffers", 1,
+                 "max-size-bytes", 0,
+                 "max-size-time", 0,
+                 "leaky", 2,
                  NULL);
-    g_object_set(mux,
-                 "streamable", FALSE,
-                 NULL);
-    g_object_set(sink,
-                 "location", record_path,
-                 "sync", FALSE,
-                 "async", FALSE,
-                 NULL);
-
-    gst_bin_add_many(GST_BIN(self->pipeline),
-                     mix, convert, tee,
-                     display_queue, fps,
-                     record_queue, download, record_convert, record_caps, enc, parse, mux, sink,
+    if (record_enabled) {
+        g_object_set(record_queue,
+                     "max-size-buffers", 1,
+                     "max-size-bytes", 0,
+                     "max-size-time", 0,
+                     "leaky", 2,
                      NULL);
+        g_object_set(enc,
+                     "tune", 0x00000004,
+                     "speed-preset", 1,
+                     "bitrate", 10000,
+                     NULL);
+        g_object_set(mux,
+                     "streamable", FALSE,
+                     NULL);
+        g_object_set(sink,
+                     "location", record_path,
+                     "sync", FALSE,
+                     "async", FALSE,
+                     NULL);
+    }
+
+    if (record_enabled) {
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                         mix, convert, tee,
+                         display_queue, fps,
+                         record_queue, download, record_convert, record_caps, enc, parse, mux, sink,
+                         NULL);
+    } else {
+        gst_bin_add_many(GST_BIN(self->pipeline),
+                         mix, convert, tee,
+                         display_queue, fps,
+                         NULL);
+    }
 
     if (!gst_element_link_many(mix, convert, tee, NULL)) {
         g_printerr("run_pipeline: failed to link core trunk\n");
@@ -650,17 +698,24 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         return NULL;
     }
 
-    if (!gst_element_link_many(record_queue, download, record_convert, record_caps, enc, parse, mux, sink, NULL)) {
-        g_printerr("run_pipeline: failed to link record branch\n");
-        return NULL;
+    if (record_enabled) {
+        if (!gst_element_link_many(record_queue, download, record_convert, record_caps, enc, parse, mux, sink, NULL)) {
+            g_printerr("run_pipeline: failed to link record branch\n");
+            return NULL;
+        }
     }
 
     GstPad *tee_display_pad = gst_element_request_pad_simple(tee, "src_%u");
     GstPad *display_sink_pad = gst_element_get_static_pad(display_queue, "sink");
-    GstPad *tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
-    GstPad *record_sink_pad = gst_element_get_static_pad(record_queue, "sink");
+    GstPad *tee_record_pad = nullptr;
+    GstPad *record_sink_pad = nullptr;
+    if (record_enabled) {
+        tee_record_pad = gst_element_request_pad_simple(tee, "src_%u");
+        record_sink_pad = gst_element_get_static_pad(record_queue, "sink");
+    }
 
-    if (!tee_display_pad || !display_sink_pad || !tee_record_pad || !record_sink_pad) {
+    if (!tee_display_pad || !display_sink_pad ||
+        (record_enabled && (!tee_record_pad || !record_sink_pad))) {
         g_printerr("run_pipeline: failed to get tee/request pads\n");
         if (tee_display_pad) gst_object_unref(tee_display_pad);
         if (display_sink_pad) gst_object_unref(display_sink_pad);
@@ -678,21 +733,27 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         return NULL;
     }
 
-    if (gst_pad_link(tee_record_pad, record_sink_pad) != GST_PAD_LINK_OK) {
-        g_printerr("run_pipeline: failed to link tee to record branch\n");
-        gst_object_unref(tee_display_pad);
-        gst_object_unref(display_sink_pad);
-        gst_object_unref(tee_record_pad);
-        gst_object_unref(record_sink_pad);
-        return NULL;
+    if (record_enabled) {
+        if (gst_pad_link(tee_record_pad, record_sink_pad) != GST_PAD_LINK_OK) {
+            g_printerr("run_pipeline: failed to link tee to record branch\n");
+            gst_object_unref(tee_display_pad);
+            gst_object_unref(display_sink_pad);
+            gst_object_unref(tee_record_pad);
+            gst_object_unref(record_sink_pad);
+            return NULL;
+        }
     }
 
     gst_object_unref(tee_display_pad);
     gst_object_unref(display_sink_pad);
-    gst_object_unref(tee_record_pad);
-    gst_object_unref(record_sink_pad);
+    if (tee_record_pad) gst_object_unref(tee_record_pad);
+    if (record_sink_pad) gst_object_unref(record_sink_pad);
 
-    g_print("Recording composite output to: %s\n", record_path);
+    if (record_enabled) {
+        g_print("Recording composite output to: %s\n", record_path);
+    } else {
+        g_print("Recording disabled (set GST_ENABLE_RECORD=1 to enable)\n");
+    }
 
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
@@ -714,11 +775,11 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         bg_height = std::max(bg_height, static_cast<gint>(l.ypos + l.height));
     }
 
-    // Force a stable raw-video format and canvas size before x264enc.
-    // Without this, the recorder can briefly negotiate a default 1x1 stream
-    // before glvideomixer settles on the real composite size, and matroskamux
-    // rejects the later caps change.
-    {
+    if (record_enabled) {
+        // Force a stable raw-video format and canvas size before x264enc.
+        // Without this, the recorder can briefly negotiate a default 1x1 stream
+        // before glvideomixer settles on the real composite size, and matroskamux
+        // rejects the later caps change.
         std::ostringstream oss;
         oss << "video/x-raw,format=I420,width="
             << bg_width
@@ -765,6 +826,7 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     }
 
     self->stab.assign(self->num_src, nullptr);
+    self->shaders_.assign(self->num_src, nullptr);
 
     for (int i = 0; i < self->num_src; ++i) {
         char udpsrc_nm[32], jitter_nm[32], depay_nm[32], parse_nm[32], dec_nm[32];
@@ -802,7 +864,13 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         GstCaps *rtpcaps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000");
         g_object_set(udpsrc, "caps", rtpcaps, NULL);
         gst_caps_unref(rtpcaps);
-        g_object_set(jitter, "latency", 0, "drop-on-latency", TRUE, NULL);
+        g_object_set(jitter, "latency", 10, "drop-on-latency", TRUE, NULL);
+        g_object_set(queue,
+                 "max-size-buffers", 1,
+                 "max-size-bytes", 0,
+                 "max-size-time", 0,
+                 "leaky", 2,
+                 NULL);
 
         gst_bin_add_many(GST_BIN(self->pipeline), udpsrc, jitter, depay, parse, dec, conv, glup, shader, stab, queue, NULL);
         if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec, conv, glup, shader, stab, queue, NULL)) {
@@ -812,6 +880,7 @@ void *VideoComposite::run_pipeline(gpointer user_data)
 
         g_object_set(shader, "fragment", self->shader_code.c_str(), NULL);
         self->stab[i] = GST_ELEMENT(gst_object_ref(stab));
+        self->shaders_[i] = GST_ELEMENT(gst_object_ref(shader));
 
         GstPad *sinkpad = gst_element_request_pad_simple(mix, "sink_%u");
         const auto &l = layouts[i];
@@ -858,35 +927,37 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     g_print("Running base station. Press Ctrl+C to stop.\n");
     g_main_loop_run(self->main_loop_);
 
-    GstBus *shutdown_bus = gst_element_get_bus(self->pipeline);
-    gst_element_send_event(self->pipeline, gst_event_new_eos());
+    if (self->record_enabled_) {
+        GstBus *shutdown_bus = gst_element_get_bus(self->pipeline);
+        gst_element_send_event(self->pipeline, gst_event_new_eos());
 
-    GstMessage *shutdown_msg = gst_bus_timed_pop_filtered(
-        shutdown_bus,
-        5 * GST_SECOND,
-        static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+        GstMessage *shutdown_msg = gst_bus_timed_pop_filtered(
+            shutdown_bus,
+            5 * GST_SECOND,
+            static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
 
-    if (!shutdown_msg) {
-        g_printerr("run_pipeline: timed out waiting for EOS during shutdown; finalizing file may be incomplete\n");
-    } else {
-        if (GST_MESSAGE_TYPE(shutdown_msg) == GST_MESSAGE_ERROR) {
-            GError *err = nullptr;
-            gchar *dbg = nullptr;
-            gst_message_parse_error(shutdown_msg, &err, &dbg);
-            g_printerr("run_pipeline: shutdown error from %s: %s\n",
-                       GST_OBJECT_NAME(shutdown_msg->src),
-                       err ? err->message : "unknown error");
-            if (dbg) {
-                g_printerr("run_pipeline: shutdown debug info: %s\n", dbg);
-                g_free(dbg);
+        if (!shutdown_msg) {
+            g_printerr("run_pipeline: timed out waiting for EOS during shutdown; finalizing file may be incomplete\n");
+        } else {
+            if (GST_MESSAGE_TYPE(shutdown_msg) == GST_MESSAGE_ERROR) {
+                GError *err = nullptr;
+                gchar *dbg = nullptr;
+                gst_message_parse_error(shutdown_msg, &err, &dbg);
+                g_printerr("run_pipeline: shutdown error from %s: %s\n",
+                           GST_OBJECT_NAME(shutdown_msg->src),
+                           err ? err->message : "unknown error");
+                if (dbg) {
+                    g_printerr("run_pipeline: shutdown debug info: %s\n", dbg);
+                    g_free(dbg);
+                }
+                if (err) {
+                    g_error_free(err);
+                }
             }
-            if (err) {
-                g_error_free(err);
-            }
+            gst_message_unref(shutdown_msg);
         }
-        gst_message_unref(shutdown_msg);
+        gst_object_unref(shutdown_bus);
     }
-    gst_object_unref(shutdown_bus);
 
     gst_element_set_state(self->pipeline, GST_STATE_NULL);
     gst_element_get_state(self->pipeline, NULL, NULL, 2 * GST_SECOND);
@@ -894,6 +965,11 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         if (s)
             gst_object_unref(s);
     }
+    for (auto *s : self->shaders_) {
+        if (s)
+            gst_object_unref(s);
+    }
+    self->shaders_.clear();
     gst_object_unref(self->pipeline);
     self->pipeline = nullptr;
     if (self->main_loop_) {

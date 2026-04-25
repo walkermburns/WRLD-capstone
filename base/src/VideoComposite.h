@@ -43,12 +43,16 @@ public:
     };
 
     explicit VideoComposite(const std::string &shaderPath,
-                            const std::vector<CameraFeedConfig> &feeds);
+                            const std::vector<CameraFeedConfig> &feeds,
+                            bool enableRecording = false,
+                            const std::string &recordPath = "");
 
     // Backward-compatible constructor: one feed per video port, metadata = video+1,
     // IMU node index = branch index, horizontal 1080p layout.
     explicit VideoComposite(const std::string &shaderPath,
-                            const std::vector<int> &ports);
+                            const std::vector<int> &ports,
+                            bool enableRecording = false,
+                            const std::string &recordPath = "");
 
     ~VideoComposite();
 
@@ -62,6 +66,7 @@ private:
     GstElement *mix_element;
     GMainLoop *main_loop_;
     std::vector<GstElement*> stab;
+    std::vector<GstElement*> shaders_;
 
     int num_src;
     std::vector<CameraFeedConfig> feeds_;
@@ -71,6 +76,8 @@ private:
     std::vector<std::unique_ptr<BuoyNode>> *nodes_ = nullptr;
 
     std::string shader_code;
+    bool record_enabled_ = false;
+    std::string record_path_override_;
 
     float live_k1;
     Quaternion quat_;

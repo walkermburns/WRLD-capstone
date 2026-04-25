@@ -34,9 +34,43 @@ static VideoComposite::CameraMount parseCameraMount(const std::string &mount)
     return VideoComposite::CameraMount::Front;
 }
 
-int main()
+int main(int argc, char **argv)
 {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
+
+    bool enableRecording = false;
+    std::string recordPath;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--record") {
+            enableRecording = true;
+            continue;
+        }
+        if (arg == "--record-path") {
+            if (i + 1 >= argc) {
+                std::cerr << "missing value for --record-path\n";
+                return -1;
+            }
+            enableRecording = true;
+            recordPath = argv[++i];
+            continue;
+        }
+        if (arg.rfind("--record-path=", 0) == 0) {
+            enableRecording = true;
+            recordPath = arg.substr(std::string("--record-path=").size());
+            continue;
+        }
+        if (arg == "-h" || arg == "--help") {
+            std::cout << "Usage: ./base_station [--record] [--record-path <file>]\n"
+                      << "  --record                Enable composite recording\n"
+                      << "  --record-path <file>    Enable recording and write to <file>\n";
+            return 0;
+        }
+
+        std::cerr << "unknown option: " << arg << "\n";
+        std::cerr << "Use --help for usage.\n";
+        return -1;
+    }
 
     TargetsConfig cfg;
     if (!loadTargetsConfig("../../targets.yaml", cfg)) {
@@ -127,7 +161,7 @@ int main()
         return -1;
     }
 
-    VideoComposite vc(shaderPath, feeds);
+    VideoComposite vc(shaderPath, feeds, enableRecording, recordPath);
     vc.setBuoyNodes(&nodes);
 
     auto sigHandler = [](int){ running = false; };
