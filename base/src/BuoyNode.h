@@ -50,21 +50,24 @@ public:
     // returned.  thread-safe; callers may invoke from any thread while
     // the internal receive thread is running.
     MathHelpers::Quaternion getQuaternion() const;
-
     // return the latest 3x3 inverse homography matrix computed from the
-    // last IMU message.  entries are returned in row-major order.  if no
-    // message has arrived yet the identity matrix is returned.  protected by
-    // the same mutex as the quaternion so simultaneous access is safe.
+    // last IMU message for a front-facing camera.
     std::array<float,9> getHinv() const;
 
-    // lookup Hinv closest to a specific IMU timestamp.  returns true if a
-    // sample exists (i.e. we've received at least one message); output will
-    // contain the nearest matrix.  timestamps and history are maintained in
-    // microseconds.  The lookup does a linear scan of the stored window
-    // (bounded to ~100ms worth of data) which is small enough for 100Hz.
-    // bool getHinvAt(uint64_t timestamp, std::array<float,9> &out) const;
+    // return the latest homography using either the normal front-camera
+    // mounting transform or a rear-facing camera transform.
+    std::array<float,9> getHinvForCamera(bool rear_facing) const;
+
+    // lookup Hinv closest to a specific IMU timestamp for a front-facing camera.
     bool getHinvAt(uint64_t timestamp, std::array<float,9> &out,
-               uint64_t *best_diff_us = nullptr) const;
+                   uint64_t *best_diff_us = nullptr) const;
+
+    // lookup Hinv closest to a specific IMU timestamp using either the normal
+    // front-camera mounting transform or a rear-facing camera transform.
+    bool getHinvAtForCamera(uint64_t timestamp,
+                            std::array<float,9> &out,
+                            bool rear_facing,
+                            uint64_t *best_diff_us = nullptr) const;
 private:
     // mutex used by printMessage
     static std::mutex printMutex;

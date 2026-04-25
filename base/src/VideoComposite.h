@@ -21,8 +21,35 @@ class VideoComposite {
 public:
     using Quaternion = MathHelpers::Quaternion;
 
+    enum class CameraMount {
+        Front,
+        RearYaw180
+    };
+
+    struct CameraLayout {
+        int xpos = 0;
+        int ypos = 0;
+        int width = 1920;
+        int height = 1080;
+    };
+
+    struct CameraFeedConfig {
+        std::string name;
+        int video_port = 0;
+        int metadata_port = 0;
+        int imu_node_index = 0;
+        CameraMount mount = CameraMount::Front;
+        CameraLayout layout;
+    };
+
+    explicit VideoComposite(const std::string &shaderPath,
+                            const std::vector<CameraFeedConfig> &feeds);
+
+    // Backward-compatible constructor: one feed per video port, metadata = video+1,
+    // IMU node index = branch index, horizontal 1080p layout.
     explicit VideoComposite(const std::string &shaderPath,
                             const std::vector<int> &ports);
+
     ~VideoComposite();
 
     void setBuoyNodes(std::vector<std::unique_ptr<BuoyNode>> *nodes);
@@ -37,7 +64,7 @@ private:
     std::vector<GstElement*> stab;
 
     int num_src;
-    std::vector<int> video_ports;
+    std::vector<CameraFeedConfig> feeds_;
     GstStructure *uniforms;
 
     std::vector<bool> branch_active;

@@ -133,6 +133,24 @@ static float rad_to_deg(float radians)
     return radians * 180.0f / static_cast<float>(M_PI);
 }
 
+static void make_rear_Rflu2cv(const float R_front[9], float R_rear[9])
+{
+    // Rear camera is modeled as the front camera rotated 180 deg about
+    // the buoy/body Z axis.  R_rear = R_front * Rz(pi).
+    // Since Rz(pi) = diag(-1, -1, 1), this flips columns 0 and 1.
+    R_rear[0] = -R_front[0];
+    R_rear[1] = -R_front[1];
+    R_rear[2] =  R_front[2];
+
+    R_rear[3] = -R_front[3];
+    R_rear[4] = -R_front[4];
+    R_rear[5] =  R_front[5];
+
+    R_rear[6] = -R_front[6];
+    R_rear[7] = -R_front[7];
+    R_rear[8] =  R_front[8];
+}
+
 // static member definitions
 std::mutex BuoyNode::printMutex;
 
@@ -393,34 +411,65 @@ MathHelpers::Quaternion BuoyNode::getQuaternion() const {
     return lastQuat_;
 }
 
-std::array<float,9> BuoyNode::getHinv() const {
-    std::array<float,9> out;
-    std::lock_guard<std::mutex> lock(quatMutex_);
-    for (int i = 0; i < 9; ++i)
-        out[i] = lastHinv_[i];
-    return out;
+std::array<float,9> BuoyNode::getHinv() const
+{
+    return getHinvForCamera(false);
 }
 
-// bool BuoyNode::getHinvAt(uint64_t timestamp, std::array<float,9> &out) const {
-//     std::lock_guard<std::mutex> lock(quatMutex_);
-//     if (hist_.empty())
-//         return false;
-//     uint64_t bestDiff = UINT64_MAX;
-//     bool found = false;
-//     for (const auto &p : hist_) {
-//         uint64_t diff = (p.first > timestamp) ? p.first - timestamp : timestamp - p.first;
-//         if (diff < bestDiff) {
-//             bestDiff = diff;
-//             out = p.second;
-//             found = true;
-//         }
-//     }
-//     return found;
-// }
+std::array<float,9> BuoyNode::getHinvForCamera(bool rear_facing) const
+{
+    std::array<float,9> out;
+    std::lock_guard<std::mutex> lock(quatMutex_);
+
+    if (!rear_facing) {
+        for (int i = 0; i < 9; ++i)
+            out[i] = lastHinv_[i];
+        return out;
+    }
+
+    float R_camera[9];
+    make_rear_Rflu2cv(Rflu2cv_mat, R_camera);
+
+    float Hinv[9];
+    Quaternion quat_ref_local = quat_ref;
+    bool have_ref_local = have_ref;
+    float pitch_filt_local = corr_pitch_filt;
+    float roll_filt_local = corr_roll_filt;
+
+    bool ok = compute_homography_from_quat(lastQuat_,
+                                           quat_ref_local,
+                                           have_ref_local,
+                                           corr_smooth_alpha,
+                                           pitch_filt_local,
+                                           roll_filt_local,
+                                           R_camera,
+                                           K,
+                                           Kinv,
+                                           cam_w,
+                                           cam_h,
+                                           Hinv,
+                                           nullptr);
+    if (ok) {
+        for (int i = 0; i < 9; ++i)
+            out[i] = Hinv[i];
+    } else {
+        for (int i = 0; i < 9; ++i)
+            out[i] = (i % 4 == 0) ? 1.0f : 0.0f;
+    }
+    return out;
+}
 
 bool BuoyNode::getHinvAt(uint64_t timestamp,
                          std::array<float,9> &out,
                          uint64_t *best_diff_us) const
+{
+    return getHinvAtForCamera(timestamp, out, false, best_diff_us);
+}
+
+bool BuoyNode::getHinvAtForCamera(uint64_t timestamp,
+                                  std::array<float,9> &out,
+                                  bool rear_facing,
+                                  uint64_t *best_diff_us) const
 {
     std::lock_guard<std::mutex> lock(quatMutex_);
 
@@ -499,13 +548,21 @@ bool BuoyNode::getHinvAt(uint64_t timestamp,
 
     
 
+    float R_camera[9];
+    if (rear_facing) {
+        make_rear_Rflu2cv(Rflu2cv_mat, R_camera);
+    } else {
+        for (int j = 0; j < 9; ++j)
+            R_camera[j] = Rflu2cv_mat[j];
+    }
+
     bool ok = compute_homography_from_quat(q_query,
                                            quat_ref_local,
                                            have_ref_local,
                                            corr_smooth_alpha,
                                            pitch_filt_local,
                                            roll_filt_local,
-                                           Rflu2cv_mat,
+                                           R_camera,
                                            K,
                                            Kinv,
                                            cam_w,

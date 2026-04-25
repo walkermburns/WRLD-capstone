@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <iomanip>
+#include <algorithm>
 
 using namespace MathHelpers;
 
@@ -97,8 +98,35 @@ static std::string make_default_record_path()
 }
 
 
+static std::vector<VideoComposite::CameraFeedConfig>
+make_feeds_from_legacy_ports(const std::vector<int> &ports)
+{
+    std::vector<VideoComposite::CameraFeedConfig> feeds;
+    feeds.reserve(ports.size());
+    for (size_t i = 0; i < ports.size(); ++i) {
+        VideoComposite::CameraFeedConfig cfg;
+        cfg.name = "camera" + std::to_string(i);
+        cfg.video_port = ports[i];
+        cfg.metadata_port = ports[i] + 1;
+        cfg.imu_node_index = static_cast<int>(i);
+        cfg.mount = VideoComposite::CameraMount::Front;
+        cfg.layout.xpos = static_cast<int>(i) * 1920;
+        cfg.layout.ypos = 0;
+        cfg.layout.width = 1920;
+        cfg.layout.height = 1080;
+        feeds.push_back(cfg);
+    }
+    return feeds;
+}
+
 VideoComposite::VideoComposite(const std::string &shaderPath,
                                const std::vector<int> &ports)
+    : VideoComposite(shaderPath, make_feeds_from_legacy_ports(ports))
+{
+}
+
+VideoComposite::VideoComposite(const std::string &shaderPath,
+                               const std::vector<CameraFeedConfig> &feeds)
     : pipeline(nullptr), mix_element(nullptr), main_loop_(nullptr), live_k1(0.3f), live_zoom(1.1f),
       live_w(1920.0f), live_h(1080.0f),
       live_h00(1.0f), live_h01(0.0f), live_h02(0.0f),
@@ -106,8 +134,8 @@ VideoComposite::VideoComposite(const std::string &shaderPath,
       live_h20(0.0f), live_h21(0.0f), live_h22(1.0f),
       num_src(0), uniforms(nullptr), stab(), branch_active(), quat_(), nodes_(nullptr)
 {
-    video_ports = ports;
-    num_src = static_cast<int>(video_ports.size());
+    feeds_ = feeds;
+    num_src = static_cast<int>(feeds_.size());
     stab.assign(num_src, nullptr);
     branch_active.assign(num_src, false);
     frame_pts_to_imu_offset_us_.assign(num_src, 0LL);
@@ -197,7 +225,7 @@ void VideoComposite::start_metadata_receivers()
     meta_threads_running_ = true;
     meta_threads_.clear();
     for (int i = 0; i < num_src; ++i) {
-        const int meta_port = video_ports[i] + 1;
+        const int meta_port = feeds_[i].metadata_port;
         meta_threads_.emplace_back(&VideoComposite::metadata_receiver_loop, this, i, meta_port);
     }
 }
@@ -402,12 +430,14 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
         last_ts = frame_ts_us;
     }
 
-    int idx = i;
+    int idx = self->feeds_[i].imu_node_index;
+    const bool rear_facing = (self->feeds_[i].mount == CameraMount::RearYaw180);
+
     const char *env = getenv("IMU_ALL");
     if (env) {
         char *end = nullptr;
         long v = strtol(env, &end, 10);
-        if (end != env && v >= 0 && v < self->num_src) {
+        if (end != env && self->nodes_ && v >= 0 && v < (long)self->nodes_->size()) {
             idx = static_cast<int>(v);
         }
     }
@@ -432,14 +462,14 @@ GstPadProbeReturn VideoComposite::imu_probe_cb(GstPad *pad, GstPadProbeInfo *inf
         reused_last_H_due_to_missing_meta = true;
     }
 
-    if (!got_hinv && self->nodes_ && idx < (int)self->nodes_->size()) {
+    if (!got_hinv && self->nodes_ && idx >= 0 && idx < (int)self->nodes_->size()) {
         if (have_frame_ts && query_ts_us >= 0) {
-            got_hinv = (*self->nodes_)[idx]->getHinvAt(
-                static_cast<uint64_t>(query_ts_us), H, &best_diff_us);
+            got_hinv = (*self->nodes_)[idx]->getHinvAtForCamera(
+                static_cast<uint64_t>(query_ts_us), H, rear_facing, &best_diff_us);
         }
 
         if (!got_hinv) {
-            auto mat = (*self->nodes_)[idx]->getHinv();
+            auto mat = (*self->nodes_)[idx]->getHinvForCamera(rear_facing);
             for (int j = 0; j < 9; ++j)
                 H[j] = mat[j];
             got_hinv = true;
@@ -566,13 +596,14 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     GstElement *record_queue = gst_element_factory_make("queue", "record_queue");
     GstElement *download = gst_element_factory_make("gldownload", "record_gldownload");
     GstElement *record_convert = gst_element_factory_make("videoconvert", "record_convert");
+    GstElement *record_caps = gst_element_factory_make("capsfilter", "record_caps");
     GstElement *enc = gst_element_factory_make("x264enc", "record_enc");
     GstElement *parse = gst_element_factory_make("h264parse", "record_parse_out");
     GstElement *mux = gst_element_factory_make("matroskamux", "record_mux");
     GstElement *sink = gst_element_factory_make("filesink", "record_sink");
 
     if (!mix || !convert || !tee || !display_queue || !fps || !videosink ||
-        !record_queue || !download || !record_convert || !enc || !parse || !mux || !sink) {
+        !record_queue || !download || !record_convert || !record_caps || !enc || !parse || !mux || !sink) {
         g_printerr("run_pipeline: could not create core elements\n");
         return NULL;
     }
@@ -606,7 +637,7 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     gst_bin_add_many(GST_BIN(self->pipeline),
                      mix, convert, tee,
                      display_queue, fps,
-                     record_queue, download, record_convert, enc, parse, mux, sink,
+                     record_queue, download, record_convert, record_caps, enc, parse, mux, sink,
                      NULL);
 
     if (!gst_element_link_many(mix, convert, tee, NULL)) {
@@ -619,7 +650,7 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         return NULL;
     }
 
-    if (!gst_element_link_many(record_queue, download, record_convert, enc, parse, mux, sink, NULL)) {
+    if (!gst_element_link_many(record_queue, download, record_convert, record_caps, enc, parse, mux, sink, NULL)) {
         g_printerr("run_pipeline: failed to link record branch\n");
         return NULL;
     }
@@ -666,17 +697,38 @@ void *VideoComposite::run_pipeline(gpointer user_data)
     struct SinkLayout { gint xpos, ypos, width, height; };
     std::vector<SinkLayout> layouts;
     layouts.reserve(self->num_src);
+
+    gint bg_width = 1;
+    gint bg_height = 1;
+
     for (int i = 0; i < self->num_src; ++i) {
+        const auto &cfg = self->feeds_[i];
         SinkLayout l;
-        l.xpos = i * 1920;
-        l.ypos = 0;
-        l.width = 1920;
-        l.height = 1080;
+        l.xpos = cfg.layout.xpos;
+        l.ypos = cfg.layout.ypos;
+        l.width = cfg.layout.width;
+        l.height = cfg.layout.height;
         layouts.push_back(l);
+
+        bg_width = std::max(bg_width, static_cast<gint>(l.xpos + l.width));
+        bg_height = std::max(bg_height, static_cast<gint>(l.ypos + l.height));
     }
 
-    gint bg_width = (self->num_src > 0 ? self->num_src : 1) * 1920;
-    gint bg_height = 1080;
+    // Force a stable raw-video format and canvas size before x264enc.
+    // Without this, the recorder can briefly negotiate a default 1x1 stream
+    // before glvideomixer settles on the real composite size, and matroskamux
+    // rejects the later caps change.
+    {
+        std::ostringstream oss;
+        oss << "video/x-raw,format=I420,width="
+            << bg_width
+            << ",height="
+            << bg_height
+            << ",framerate=60/1";
+        GstCaps *rcaps = gst_caps_from_string(oss.str().c_str());
+        g_object_set(record_caps, "caps", rcaps, NULL);
+        gst_caps_unref(rcaps);
+    }
 
     {
         GstElement *bg_src = gst_element_factory_make("videotestsrc", "bg_src");
@@ -744,7 +796,7 @@ void *VideoComposite::run_pipeline(gpointer user_data)
             return NULL;
         }
 
-        int port = (i < (int)self->video_ports.size() ? self->video_ports[i] : 0);
+        int port = self->feeds_[i].video_port;
         g_object_set(udpsrc, "port", port, NULL);
 
         GstCaps *rtpcaps = gst_caps_from_string("application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000");

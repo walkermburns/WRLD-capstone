@@ -1,6 +1,6 @@
 global:
   base:
-    LAN_IP: 192.168.1.9
+    LAN_IP: 192.168.1.10
 
 
 targets:
@@ -16,9 +16,21 @@ targets:
     camera_name: "/base/soc/i2c0mux/i2c@0/imx708@1a"
     camera2_name: "/base/soc/i2c0mux/i2c@1/imx708@1a"
     path: "~/buoy/"
+    imu_port: 5001
     video_port: 5101
     video2_port: 5201
-    imu_port: 5001
+    cameras:
+        - name: front
+          video_port: 5101
+          metadata_port: 5102
+          mount: front
+          layout: {x: 0, y: 0, width: 1920, height: 1080}
+
+        - name: rear
+          video_port: 5201
+          metadata_port: 5202
+          mount: rear_yaw_180
+          layout: {x: 1920, y: 0, width: 1920, height: 1080}
   # - name: mola2
   #   host: walker@192.168.1.21
   #   LAN_IP: 192.168.1.21

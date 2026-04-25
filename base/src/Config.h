@@ -3,18 +3,49 @@
 #include <string>
 #include <vector>
 
-// Configuration structures reflecting the layout of targets.yaml as used by
-// the *base station* software.  We only care about fields that the base
-// needs (node name/ports, global base address) but the loader is intentionally
-// permissive so that additional keys can be ignored without causing an error.
+// Configuration structures reflecting targets.yaml as used by the base station.
+//
+// Legacy format supported:
+//   targets:
+//     - name: buoy0
+//       video_port: 5103
+//       imu_port: 5003
+//
+// New multi-camera format supported:
+//   targets:
+//     - name: buoy0
+//       imu_port: 5003
+//       cameras:
+//         - name: front
+//           video_port: 5103
+//           metadata_port: 5104
+//           mount: front
+//           layout: {x: 0, y: 0, width: 1920, height: 1080}
+//         - name: rear
+//           video_port: 5105
+//           metadata_port: 5106
+//           mount: rear_yaw_180
+//           layout: {x: 1920, y: 0, width: 1920, height: 1080}
+
+struct CameraConfig {
+    std::string name;
+    int videoPort = 0;
+    int metadataPort = 0; // if omitted, defaults to videoPort + 1 in Config.cpp
+    std::string mount = "front";
+    int x = 0;
+    int y = 0;
+    int width = 1920;
+    int height = 1080;
+};
 
 struct NodeConfig {
     std::string name;
     std::string host;
     std::string lanIp;
     std::string path;
-    int videoPort = 0;
+    int videoPort = 0; // legacy single-camera field
     int imuPort = 0;
+    std::vector<CameraConfig> cameras;
 };
 
 struct GlobalConfig {
@@ -26,8 +57,4 @@ struct TargetsConfig {
     std::vector<NodeConfig> targets;
 };
 
-// Load an entire targets.yaml file.  Returns true on success, false otherwise.
-// The loader tolerates missing fields and will leave defaults in the struct.
-// It is the caller's responsibility to verify that the meaningful values (eg
-// imuPort) were actually provided.
 bool loadTargetsConfig(const std::string &path, TargetsConfig &cfg);
