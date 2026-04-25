@@ -136,22 +136,25 @@ int main()
     std::signal(SIGABRT, sigHandler);
     std::signal(SIGHUP,  sigHandler);
 
-    std::thread video_thread([&]() {
-        try {
-            vc.start();
-        } catch (const std::exception &e) {
-            std::cerr << "VideoComposite error: " << e.what() << "\n";
-            running = false;
+    // Keep GStreamer/AppKit initialization on the main thread. On macOS,
+    // gst_macos_main must not run from a worker thread.
+    std::thread stop_watcher([&]() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        vc.stop();
     });
 
-    while (running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    try {
+        vc.start();
+    } catch (const std::exception &e) {
+        std::cerr << "VideoComposite error: " << e.what() << "\n";
+        running = false;
     }
 
-    vc.stop();
-    if (video_thread.joinable())
-        video_thread.join();
+    running = false;
+    if (stop_watcher.joinable())
+        stop_watcher.join();
 
     for (auto &node : nodes)
         node->stop();

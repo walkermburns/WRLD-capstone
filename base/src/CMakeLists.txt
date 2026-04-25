@@ -6,7 +6,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # --- PROTOBUF SECTION ---
-find_package(Protobuf REQUIRED)
+# Prefer Protobuf config mode so imported targets carry transitive
+# dependencies (absl/utf8_range on newer protobuf releases).
+set(protobuf_MODULE_COMPATIBLE ON CACHE BOOL "Use FindProtobuf-compatible helpers" FORCE)
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+    find_package(Protobuf REQUIRED)
+endif()
 
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ../../buoy.proto)
 
