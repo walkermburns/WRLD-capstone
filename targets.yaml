@@ -28,7 +28,7 @@ targets:
           video_port: 5201
           metadata_port: 5401
           mount: rear_yaw_180
-          layout: {x: 1920, y: 0, width: 1920, height: 1080}
+          layout: {x: 0, y: 1080, width: 1920, height: 1080}
   # - name: mola2
   #   host: walker@192.168.1.21
   #   LAN_IP: 192.168.1.21
