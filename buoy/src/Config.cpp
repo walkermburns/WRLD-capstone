@@ -18,7 +18,10 @@ bool loadTargetConfig(const std::string &path, TargetConfig &cfg)
             YAML::Node t = root["targets"][0];
             if (t["LAN_IP"]) cfg.buoyIp = t["LAN_IP"].as<std::string>();
             if (t["video_port"]) cfg.videoPort = t["video_port"].as<int>();
+            if (t["video2_port"]) cfg.video2Port = t["video2_port"].as<int>();
             if (t["imu_port"]) cfg.imuPort = t["imu_port"].as<int>();
+            if (t["camera_name"]) cfg.cameraName = t["camera_name"].as<std::string>();
+            if (t["camera2_name"]) cfg.camera2Name = t["camera2_name"].as<std::string>();
         }
 
         // fallback defaults if not provided
@@ -28,6 +31,8 @@ bool loadTargetConfig(const std::string &path, TargetConfig &cfg)
             cfg.imuPort = 5000; // legacy default
         if (cfg.videoPort == 0)
             cfg.videoPort = 5001;
+        if (cfg.cameraName.empty())
+            cfg.cameraName = "0";
 
         return true;
     } catch (const YAML::Exception &e) {

@@ -10,6 +10,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
+#include <cctype>
+#include <sstream>
 
 namespace {
 std::mutex g_au_ts_mutex;
@@ -40,6 +43,56 @@ static uint64_t htonll_u64(uint64_t x)
 #else
     return x;
 #endif
+}
+
+constexpr const char *kCam0Name = "/base/soc/i2c0mux/i2c@0/imx708@1a";
+constexpr const char *kCam1Name = "/base/soc/i2c0mux/i2c@1/imx708@1a";
+
+static std::string to_lower_copy(std::string s)
+{
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+static int camera_name_to_index(const std::string &cameraName)
+{
+    if (cameraName.find("i2c@0") != std::string::npos ||
+        cameraName == kCam0Name) {
+        return 0;
+    }
+    if (cameraName.find("i2c@1") != std::string::npos ||
+        cameraName == kCam1Name) {
+        return 1;
+    }
+    return -1;
+}
+
+static std::string camera_selector_to_name(const std::string &selector, int defaultIndex)
+{
+    if (selector.empty()) {
+        return defaultIndex == 0 ? kCam0Name : kCam1Name;
+    }
+
+    const std::string lowered = to_lower_copy(selector);
+    if (lowered == "0" || lowered == "cam0" || lowered == "camera0" ||
+        lowered == "i2c@0") {
+        return kCam0Name;
+    }
+    if (lowered == "1" || lowered == "cam1" || lowered == "camera1" ||
+        lowered == "i2c@1") {
+        return kCam1Name;
+    }
+
+    if (selector.find("i2c@0") != std::string::npos) {
+        return kCam0Name;
+    }
+    if (selector.find("i2c@1") != std::string::npos) {
+        return kCam1Name;
+    }
+
+    return selector;
 }
 
 // Latch one sender timestamp per encoded H264 access unit entering rtph264pay.
@@ -100,16 +153,45 @@ static GstPadProbeReturn latch_access_unit_timestamp_probe(GstPad *, GstPadProbe
 }
 } // namespace
 
-VideoStreamer::VideoStreamer(const std::string &dstIp, int dstPort)
+VideoStreamer::VideoStreamer(const std::string &dstIp,
+                             int dstPort,
+                             int dstPort2,
+                             const std::string &cameraSelector,
+                             const std::string &camera2Selector)
 {
-    pipelineDesc_ = "libcamerasrc ! video/x-raw,width=1920,height=1080,framerate=30/1 ! "
-                    "queue max-size-buffers=1 leaky=downstream ! "
-                    "v4l2h264enc extra-controls=\"controls,video_bitrate=20000000,repeat_sequence_header=1,iframe-period=30\" ! "
-                    "video/x-h264,level=(string)4 ! "
-                    "rtph264pay name=pay0 config-interval=1 pt=96 ssrc=305419896 seqnum-offset=1000 timestamp-offset=2000 ! "
-                    "udpsink name=usink host=" + dstIp + " port=" + std::to_string(dstPort) + " sync=false";
+    const std::string camPrimary = camera_selector_to_name(cameraSelector, 0);
+    const int primaryIndex = camera_name_to_index(camPrimary);
+    const int secondaryIndex = primaryIndex == 0 ? 1 : 0;
+    const std::string camSecondary = camera_selector_to_name(camera2Selector, secondaryIndex);
+
+    std::ostringstream pipeline;
+    pipeline << "libcamerasrc camera-name=\"" << camPrimary << "\" "
+             << "! video/x-raw,width=1920,height=1080,framerate=30/1 "
+             << "! queue max-size-buffers=1 leaky=downstream "
+             << "! v4l2h264enc extra-controls=\"controls,video_bitrate=20000000,repeat_sequence_header=1,iframe-period=30\" "
+             << "! video/x-h264,level=(string)4 "
+             << "! rtph264pay name=pay0 config-interval=1 pt=96 ssrc=305419896 seqnum-offset=1000 timestamp-offset=2000 "
+             << "! udpsink name=usink host=" << dstIp << " port=" << dstPort << " sync=false";
+
+    if (dstPort2 > 0) {
+        pipeline << " "
+                 << "libcamerasrc camera-name=\"" << camSecondary << "\" "
+                 << "! video/x-raw,width=1920,height=1080,framerate=30/1,format=I420 "
+                 << "! queue max-size-buffers=2 leaky=downstream "
+                 << "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=6000 key-int-max=30 bframes=0 cabac=false ref=1 sliced-threads=true threads=4 "
+                 << "! video/x-h264,profile=baseline "
+                 << "! rtph264pay name=pay1 config-interval=1 pt=96 ssrc=305419897 seqnum-offset=3000 timestamp-offset=4000 "
+                 << "! udpsink name=usink2 host=" << dstIp << " port=" << dstPort2 << " sync=false";
+    }
+
+    pipelineDesc_ = pipeline.str();
 
     std::cout << "[video] pipeline desc: " << pipelineDesc_ << std::endl;
+    std::cout << "[video] stream1 camera-name=" << camPrimary << std::endl;
+    if (dstPort2 > 0) {
+        std::cout << "[video] stream2 enabled on port " << dstPort2
+                  << " using camera-name=" << camSecondary << std::endl;
+    }
     gst_init(nullptr, nullptr);
 
     const int metaPort = dstPort + 1;

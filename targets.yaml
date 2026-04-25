@@ -1,6 +1,6 @@
 global:
   base:
-    LAN_IP: 192.168.1.10
+    LAN_IP: 192.168.1.9
 
 
 targets:
@@ -10,24 +10,29 @@ targets:
   #   path: "~/buoy/"
   #   video_port: 5101
   #   imu_port: 5001
-  # - name: mola1
-  #   host: walker@192.168.1.20
-  #   LAN_IP: 192.168.1.20
-  #   path: "~/buoy/"
-  #   video_port: 5101
-  #   imu_port: 5001
+  - name: mola1
+    host: walker@192.168.1.20
+    LAN_IP: 192.168.1.20
+    camera_name: "/base/soc/i2c0mux/i2c@0/imx708@1a"
+    camera2_name: "/base/soc/i2c0mux/i2c@1/imx708@1a"
+    path: "~/buoy/"
+    video_port: 5101
+    video2_port: 5201
+    imu_port: 5001
   # - name: mola2
   #   host: walker@192.168.1.21
   #   LAN_IP: 192.168.1.21
   #   path: "~/buoy/"
   #   video_port: 5102
+  #   video2_port: 5202
   #   imu_port: 5002
-  - name: mola3
-    host: walker@192.168.1.22
-    LAN_IP: 192.168.1.22
-    path: "~/buoy/"
-    video_port: 5103
-    imu_port: 5003
+  # - name: mola3
+  #   host: walker@192.168.1.22
+  #   LAN_IP: 192.168.1.22
+  #   path: "~/buoy/"
+  #   video_port: 5103
+  #   video2_port: 5203
+  #   imu_port: 5003
 
 # Camera parameters – resolution, framerate, bitrate, encoder type.
 # IMU settings – sample rate, filter coefficients, calibration file

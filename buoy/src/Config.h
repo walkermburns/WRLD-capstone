@@ -11,6 +11,9 @@ struct TargetConfig {
     std::string buoyIp;      // IP address of this buoy node
     int imuPort = 0;         // port for IMU protobuf messages (destination is baseIp)
     int videoPort = 0;       // port for video RTP stream (destination is baseIp)
+    int video2Port = 0;      // optional port for a second video RTP stream
+    std::string cameraName;  // camera selector for stream 1 (cam0/cam1/path)
+    std::string camera2Name; // optional camera selector for stream 2 (cam0/cam1/path)
 };
 
 // load the YAML file at the given path, return false on failure.  If multiple

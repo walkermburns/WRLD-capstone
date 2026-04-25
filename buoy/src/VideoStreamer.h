@@ -11,7 +11,11 @@
 
 class VideoStreamer {
 public:
-    VideoStreamer(const std::string &dstIp, int dstPort);
+    VideoStreamer(const std::string &dstIp,
+                  int dstPort,
+                  int dstPort2 = 0,
+                  const std::string &cameraSelector = "0",
+                  const std::string &camera2Selector = "");
     ~VideoStreamer();
 
     // non-copyable, movable only for simplicity

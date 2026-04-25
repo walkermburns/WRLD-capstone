@@ -127,7 +127,10 @@ int main()
     std::cout << "[main] loaded config: baseIp=" << cfg.baseIp
               << " buoyIp=" << cfg.buoyIp
               << " imuPort=" << cfg.imuPort
-              << " videoPort=" << cfg.videoPort << "\n";
+              << " videoPort=" << cfg.videoPort
+              << " video2Port=" << cfg.video2Port
+              << " camera_name=" << cfg.cameraName
+              << " camera2_name=" << cfg.camera2Name << "\n";
 
     // create concrete sensor implementation; keep old driver available, now using BMI323
     // BNO055Driver imu;
@@ -158,7 +161,11 @@ int main()
     std::thread networkThread(senderLoop, std::ref(sender));
 
     // simultaneously start the video streamer; uses an independent port
-    VideoStreamer video(cfg.baseIp, cfg.videoPort);
+    VideoStreamer video(cfg.baseIp,
+                        cfg.videoPort,
+                        cfg.video2Port,
+                        cfg.cameraName,
+                        cfg.camera2Name);
     std::cout << "[main] video streamer constructed\n";
     video.start();
     std::cout << "[main] video thread started\n";
