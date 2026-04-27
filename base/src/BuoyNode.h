@@ -92,7 +92,7 @@ private:
     // camera/intrinsic parameters used for homography calculation
     float cam_w = 1920.0f;
     float cam_h = 1080.0f;
-    float cam_hfov_deg = 50.0f;
+    float cam_hfov_deg = 102.0f;
     float K[9];
     float Kinv[9];
     float Rflu2cv_mat[9];
