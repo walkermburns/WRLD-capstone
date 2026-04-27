@@ -848,12 +848,13 @@ void *VideoComposite::run_pipeline(gpointer user_data)
         GstElement *parse  = gst_element_factory_make("h264parse", parse_nm);
         GstElement *dec    = gst_element_factory_make("avdec_h264", dec_nm);
         GstElement *conv   = gst_element_factory_make("videoconvert", conv_nm);
+        GstElement *crop   = gst_element_factory_make("videocrop", (std::string("crop") + std::to_string(i)).c_str());
         GstElement *glup   = gst_element_factory_make("glupload", glup_nm);
         GstElement *shader = gst_element_factory_make("glshader", shader_nm);
         GstElement *stab   = gst_element_factory_make("gltransformation", stab_nm);
         GstElement *queue  = gst_element_factory_make("queue", queue_nm);
 
-        if (!udpsrc || !jitter || !depay || !parse || !dec || !conv || !glup || !shader || !stab || !queue) {
+        if (!udpsrc || !jitter || !depay || !parse || !dec || !conv || !crop || !glup || !shader || !stab || !queue) {
             g_printerr("run_pipeline: failed to create udp branch %d elements\n", i);
             return NULL;
         }
@@ -872,8 +873,23 @@ void *VideoComposite::run_pipeline(gpointer user_data)
                  "leaky", 2,
                  NULL);
 
-        gst_bin_add_many(GST_BIN(self->pipeline), udpsrc, jitter, depay, parse, dec, conv, glup, shader, stab, queue, NULL);
-        if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec, conv, glup, shader, stab, queue, NULL)) {
+        const int src_w = 1920;
+        const int src_h = 1080;
+        const int crop_w = std::max(0, src_w - layouts[i].width);
+        const int crop_h = std::max(0, src_h - layouts[i].height);
+        const int crop_left = crop_w / 2;
+        const int crop_right = crop_w - crop_left;
+        const int crop_top = crop_h / 2;
+        const int crop_bottom = crop_h - crop_top;
+        g_object_set(crop,
+                     "left", crop_left,
+                     "right", crop_right,
+                     "top", crop_top,
+                     "bottom", crop_bottom,
+                     NULL);
+
+        gst_bin_add_many(GST_BIN(self->pipeline), udpsrc, jitter, depay, parse, dec, conv, crop, glup, shader, stab, queue, NULL);
+        if (!gst_element_link_many(udpsrc, jitter, depay, parse, dec, conv, crop, glup, shader, stab, queue, NULL)) {
             g_printerr("run_pipeline: udp branch %d link failed\n", i);
             return NULL;
         }
